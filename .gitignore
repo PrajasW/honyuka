@@ -1,0 +1,35 @@
+# Gradle files
+.gradle/
+build/
+
+# Android Studio / IntelliJ IDEA
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# Kotlin
+.kotlin/
+.kotlin-gradle-plugin/
+
+# Local configuration file (contains local paths to SDKs)
+local.properties
+
+# Log files
+*.log
+
+# Keystores / signing keys (sensitive files)
+*.jks
+*.keystore
+*.pk8
+*.pem
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Built artifacts
+*.apk
+*.aar
+*.ap_
