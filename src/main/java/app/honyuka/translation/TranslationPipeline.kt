@@ -646,6 +646,7 @@ private class GeminiTranslationEngine(
     ) {
         batch.forEach { (pageName, page) ->
             val translatedBlocks = output.optJSONArray(pageName)
+                ?: output.optJSONArray(pageName.substringBeforeLast('.'))
             page.blocks = page.blocks
                 .mapIndexedNotNull { index, block ->
                     val translatedText = translatedBlocks
