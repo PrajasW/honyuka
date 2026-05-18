@@ -2,7 +2,7 @@
 
 **📦 Download the latest build here: [Honyuka.apk](./Honyuka.apk)**
 
-Honyuka (ほにゅか, short for Honyakuya = translator) is a standalone Android app that translates downloaded manga chapters and makes the translated output readable in Mihon (and its fork TachiyomiAT).
+Honyuka (ほにゅか, mispronunciation of Honyakuya  = translator) is a standalone Android app that translates downloaded manga chapters and makes the translated output readable in Mihon (and its fork TachiyomiAT).
 
 ## Translation Comparison
 
