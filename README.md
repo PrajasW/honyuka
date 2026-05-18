@@ -12,6 +12,27 @@ Here is a visual comparison of the translation quality:
 | :---: | :---: | :---: |
 | <!-- ![Original Image](path_to_original.png) --> <br> *Original* | <!-- ![ML Kit Image](path_to_mlkit.png) --> <br> *ML Kit* | <!-- ![Gemini Image](path_to_gemini.png) --> <br> *Gemini* |
 
+## How to Use
+
+1. **Download Manga via Mihon:** First, use the [Mihon](https://mihon.app/) app to download the chapters of the manga you want to translate.
+2. **Set the Storage Directory:** Open Honyuka and select the exact same base directory where Mihon saves your downloaded manga.
+3. **Translate:** In Honyuka, browse the list to find the manga you downloaded, open it, and simply click the **Translate** button for the chapter.
+4. **Read Translated Manga:** Once the translation process finishes, go back to Mihon and navigate to the **Local source** tab. You will find a new discoverable entry containing your fully translated manga chapter ready to be read!
+
+## Settings
+
+Honyuka offers several configuration options to customize your translation experience:
+
+- **Storage Root Folder:** Choose the root directory where your Mihon manga downloads are located.
+- **Source Language:** The original language of the manga (e.g., Japanese, Korean, Chinese).
+- **Target Language:** The language you want to translate the manga into (e.g., English).
+- **Translation Engine:** Choose between different translation providers:
+  - **Gemini:** Cloud-based translation using Google's Gemini models for highly contextual and accurate translations. Requires an API Key.
+  - **ML Kit:** On-device, offline translation provided by Google. Fast and private, but may have lower contextual quality.
+  - **DeepL:** High-quality neural machine translation. Requires an API Key.
+- **Gemini Model:** Allows you to specify the exact Gemini model to use (e.g., `gemini-2.5-flash`).
+- **API Keys:** Secure fields to enter your respective Gemini and DeepL API keys.
+
 This folder is now its own Android project. You can open `honyuka/` directly in Android Studio or build it from inside this folder without using the parent repo's Gradle setup.
 
 ## Expected Storage Root
