@@ -52,6 +52,33 @@ import kotlin.math.abs
 import org.json.JSONArray
 import org.json.JSONObject
 
+/**
+ * Stop button support. [request] sets a flag checked between chunks and fires [hook],
+ * which the on-device engine points at `Conversation.cancelProcess()` so even a
+ * multi-minute chunk stops right away.
+ */
+object TranslationStop {
+    @Volatile
+    var requested: Boolean = false
+        private set
+
+    @Volatile
+    var hook: (() -> Unit)? = null
+
+    fun request() {
+        requested = true
+        runCatching { hook?.invoke() }
+    }
+
+    fun reset() {
+        requested = false
+        hook = null
+    }
+}
+
+/** Thrown when the user taps Stop; progress up to the last finished chunk is saved. */
+class TranslationStoppedException : Exception("Stopped. Finished parts are saved — tap Translate again to continue.")
+
 class TranslationPipeline(
     private val context: Context,
 ) {
@@ -108,7 +135,7 @@ class TranslationPipeline(
         deepLApiKey: String,
         localModel: LocalModel = LocalModel.DEFAULT,
         localBackend: LocalBackend = LocalBackend.AUTO,
-        onChunkSaved: () -> Unit = {},
+        onChunkSaved: (done: Int, total: Int) -> Unit = { _, _ -> },
         onProgress: (title: String, detail: String, progress: Float) -> Unit,
     ) {
         onProgress("Translating text", "Using ${translationEngine.label} for manga dialogue", 0.65f)
@@ -123,13 +150,13 @@ class TranslationPipeline(
             localModel = localModel,
             localBackend = localBackend,
             onChunkDone = { done, total ->
-                onChunkSaved()
+                onChunkSaved(done, total)
                 onProgress(
                     "Translating text",
-                    if (translationEngine == TranslationEngine.ON_DEVICE) {
-                        "On-device: chunk $done of $total"
-                    } else {
-                        "Gemini request $done of $total done"
+                    when {
+                        done >= total -> "All $total parts translated"
+                        translationEngine == TranslationEngine.ON_DEVICE -> "On-device: part ${done + 1} of $total"
+                        else -> "Gemini: part ${done + 1} of $total"
                     },
                     0.65f + 0.3f * done / total.coerceAtLeast(1),
                 )
@@ -722,11 +749,19 @@ private abstract class LlmBatchTranslationEngine(
     override fun translate(pages: MutableMap<String, PageTranslation>) {
         val pending = collectPending(pages, applyMemoryHits = true)
         val chunks = packChunks(pending)
-        if (chunks.isNotEmpty()) prepare()
+        // Announce the total first: loading an on-device model can take a minute or more.
+        if (chunks.isNotEmpty()) {
+            onChunkDone(0, chunks.size)
+            prepare()
+        }
 
         var failure: Exception? = null
         var translatedEntries = 0
         for ((chunkIndex, chunk) in chunks.withIndex()) {
+            if (TranslationStop.requested) {
+                failure = TranslationStoppedException()
+                break
+            }
             if (chunkIndex > 0 && interRequestDelayMs > 0) Thread.sleep(interRequestDelayMs)
             val resultMap = try {
                 translateChunk(chunk, depth = 0)
@@ -750,7 +785,7 @@ private abstract class LlmBatchTranslationEngine(
         GeminiTranslationMemory.persist()
 
         failure?.let { error ->
-            if (translatedEntries == 0) throw error
+            if (error is TranslationStoppedException || translatedEntries == 0) throw error
             throw IllegalStateException(
                 "$engineName stopped after translating $translatedEntries of ${pending.size} lines: ${error.message} " +
                     "Progress was saved — translate again later and only the remaining lines will be sent.",
@@ -871,6 +906,7 @@ private abstract class LlmBatchTranslationEngine(
         return try {
             parseCompactTranslations(complete(systemPrompt(), buildCompactInput(chunk)), chunk.map { it.globalId }.toSet())
         } catch (e: Exception) {
+            if (TranslationStop.requested) throw TranslationStoppedException()
             Log.w("HonyukaLlm", "$engineName chunk of ${chunk.size} lines failed (depth $depth)", e)
             if (isFatal(e)) throw e
             if (depth >= maxSplitDepth || chunk.size < 2) return emptyMap()
@@ -1213,7 +1249,12 @@ private class LocalLlmTranslationEngine(
             throw LocalModelException("On-device model stopped responding: ${t.message}", t)
         }
         return conversation.use {
-            val reply = it.sendMessage(userText)
+            TranslationStop.hook = { runCatching { it.cancelProcess() } }
+            val reply = try {
+                it.sendMessage(userText)
+            } finally {
+                TranslationStop.hook = null
+            }
             val text = reply.contents.contents
                 .filterIsInstance<Content.Text>()
                 .joinToString("") { part -> part.text }

@@ -19,6 +19,7 @@ import app.honyuka.data.HonyukaPreferences
 import app.honyuka.data.HonyukaStorage
 import app.honyuka.export.RenderedChapterExporter
 import app.honyuka.model.ChapterEntry
+import app.honyuka.model.RunStatus
 import app.honyuka.model.LocalBackend
 import app.honyuka.model.LocalModel
 import app.honyuka.model.PageTranslation
@@ -26,6 +27,10 @@ import app.honyuka.model.SourceLanguage
 import app.honyuka.model.TargetLanguage
 import app.honyuka.model.TranslationEngine
 import app.honyuka.translation.TranslationPipeline
+import app.honyuka.translation.TranslationStop
+import app.honyuka.translation.TranslationStoppedException
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -45,6 +50,10 @@ class TranslationService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            requestStop()
+            return START_NOT_STICKY
+        }
         val chapter = intent?.toChapterEntry()
         if (chapter == null) {
             stopSelf()
@@ -78,6 +87,16 @@ class TranslationService : Service() {
         ))
 
         translationJob?.cancel()
+        TranslationStop.reset()
+        currentChapter = chapter
+        runStatus.value = RunStatus(
+            chapterKey = chapter.storageKey,
+            chapterName = chapter.chapterDisplayName,
+            title = if (rerenderOnly) "Re-rendering" else "Starting",
+            detail = "Getting ready",
+            progress = 0f,
+            startedAtMs = System.currentTimeMillis(),
+        )
         translationJob = scope.launch {
             runTranslation(
                 chapter, sourceLang, targetLang, engine, geminiApiKey, geminiModelName, deepLApiKey,
@@ -190,7 +209,17 @@ class TranslationService : Service() {
                         localModel = localModel,
                         localBackend = localBackend,
                         // Save after every request so a later failure never loses paid-for work.
-                        onChunkSaved = { storage.writeTranslation(chapter, mutableTranslations) },
+                        onChunkSaved = { done, total ->
+                            if (done > 0) storage.writeTranslation(chapter, mutableTranslations)
+                            runStatus.update { status ->
+                                status?.copy(
+                                    chunksDone = done,
+                                    chunksTotal = total,
+                                    chunksStartedAtMs = status.chunksStartedAtMs.takeIf { it > 0 }
+                                        ?: System.currentTimeMillis(),
+                                )
+                            }
+                        },
                     ) { title, detail, progress ->
                         updateNotification(title, detail, (progress * 100).toInt())
                         broadcastProgress(chapter, title, detail, progress)
@@ -214,13 +243,28 @@ class TranslationService : Service() {
 
             updateNotification("Completed ✓", chapter.chapterDisplayName, 100)
             broadcastResult(chapter, success = true)
+        } catch (e: TranslationStoppedException) {
+            updateNotification("Stopped", e.message.orEmpty(), 0)
+            broadcastResult(chapter, success = false, error = e.message)
         } catch (e: Exception) {
             Log.e(TAG, "Translation failed for ${chapter.storageKey}", e)
             updateNotification("Translation failed", e.message ?: "Unknown error", 0)
             broadcastResult(chapter, success = false, error = e.message)
         } finally {
+            runStatus.value = null
+            currentChapter = null
             stopSelf()
         }
+    }
+
+    private fun requestStop() {
+        if (runStatus.value == null) {
+            stopSelf()
+            return
+        }
+        TranslationStop.request()
+        runStatus.update { it?.copy(stopping = true, detail = "Stopping…") }
+        updateNotification("Stopping…", currentChapter?.chapterDisplayName.orEmpty(), 0)
     }
 
     private fun updateNotification(title: String, detail: String, progress: Int) {
@@ -236,9 +280,16 @@ class TranslationService : Service() {
             this, 0, tapIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 
+        val stopIntent = PendingIntent.getService(
+            this, 1, Intent(this, TranslationService::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val running = progress in 0..99 && runStatus.value?.stopping != true
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(title)
             .setContentText(detail)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(detail))
+            .apply { if (running && runStatus.value != null) addAction(0, "Stop", stopIntent) }
             .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(pendingIntent)
             .setOngoing(progress < 100)
@@ -250,6 +301,9 @@ class TranslationService : Service() {
     }
 
     private fun broadcastProgress(chapter: ChapterEntry, title: String, detail: String, progress: Float) {
+        runStatus.update { status ->
+            status?.copy(title = title, detail = if (status.stopping) "Stopping…" else detail, progress = progress)
+        }
         sendBroadcast(Intent(ACTION_PROGRESS).apply {
             setPackage(packageName)
             putExtra(EXTRA_STORAGE_KEY, chapter.storageKey)
@@ -298,6 +352,18 @@ class TranslationService : Service() {
         const val ACTION_PROGRESS = "app.honyuka.TRANSLATION_PROGRESS"
         const val ACTION_RESULT = "app.honyuka.TRANSLATION_RESULT"
         const val ACTION_REQUIRE_CONFIRMATION = "app.honyuka.TRANSLATION_REQUIRE_CONFIRMATION"
+        const val ACTION_STOP = "app.honyuka.TRANSLATION_STOP"
+
+        /** Live status of the current run (null when idle). Same process as the UI. */
+        val runStatus = MutableStateFlow<RunStatus?>(null)
+
+        @Volatile
+        private var currentChapter: ChapterEntry? = null
+
+        /** Stops the running translation (from the in-app Stop button). */
+        fun stop(context: Context) {
+            context.startService(Intent(context, TranslationService::class.java).setAction(ACTION_STOP))
+        }
         const val EXTRA_STORAGE_KEY = "storage_key"
         const val EXTRA_PROGRESS_TITLE = "progress_title"
         const val EXTRA_PROGRESS_DETAIL = "progress_detail"

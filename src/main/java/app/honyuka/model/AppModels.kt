@@ -179,6 +179,24 @@ data class HonyukaUiState(
     val message: String? = null,
     val apiTestStatus: String? = null,
     val confirmationRequest: ConfirmationRequest? = null,
+    val runStatus: RunStatus? = null,
+)
+
+/**
+ * Live state of the running translation, published by TranslationService so the UI can
+ * show it on every screen (and again after the app is reopened).
+ */
+data class RunStatus(
+    val chapterKey: String,
+    val chapterName: String,
+    val title: String,
+    val detail: String,
+    val progress: Float,
+    val startedAtMs: Long,
+    val chunksDone: Int = 0,
+    val chunksTotal: Int = 0,
+    val chunksStartedAtMs: Long = 0L,
+    val stopping: Boolean = false,
 )
 
 data class ConfirmationRequest(

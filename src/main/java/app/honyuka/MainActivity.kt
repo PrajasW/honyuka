@@ -78,6 +78,7 @@ import app.honyuka.model.HonyukaUiState
 import app.honyuka.model.LocalBackend
 import app.honyuka.model.LocalModel
 import app.honyuka.model.LocalModelStatus
+import app.honyuka.model.RunStatus
 import app.honyuka.model.SourceLanguage
 import app.honyuka.model.TargetLanguage
 import app.honyuka.model.ThemeMode
@@ -99,6 +100,7 @@ import app.honyuka.ui.PillStyle
 import app.honyuka.ui.Segmented
 import app.honyuka.ui.SoftProgressBar
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.util.zip.ZipInputStream
 
@@ -194,7 +196,8 @@ private fun HonyukaApp(
     }
 
     // At most one mascot per screen: the header avatar hides when a card shows one.
-    val jobShowsMascot = state.activeJob != null || state.message != null
+    val run = state.runStatus
+    val jobShowsMascot = run != null || state.activeJob != null || state.message != null
     val emptyShowsMascot = !settingsOpen && state.chapters.isEmpty()
     val showHeaderMascot = !jobShowsMascot && !emptyShowsMascot
 
@@ -214,6 +217,14 @@ private fun HonyukaApp(
             onSettings = { settingsOpen = true },
         )
 
+        run?.let { status ->
+            RunBanner(
+                status = status,
+                onStop = viewModel::stopTranslation,
+                modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 8.dp),
+            )
+        }
+
         if (settingsOpen) {
             SettingsScreen(state = state, viewModel = viewModel, onPickRoot = onPickRoot)
         } else {
@@ -222,7 +233,7 @@ private fun HonyukaApp(
                 contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 120.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
-                state.activeJob?.let { job ->
+                state.activeJob?.takeIf { run == null }?.let { job ->
                     item(key = "job") {
                         JobCard(title = job.title, detail = job.detail, progress = job.progress, running = state.isBusy)
                     }
@@ -774,6 +785,78 @@ private fun MangaThumbnail(
 }
 
 // ── Status cards ────────────────────────────────────────────────────────────
+
+/**
+ * Always-visible card for the running translation: chapter, current step, part X of Y,
+ * elapsed time, a rough time left, and a Stop button.
+ */
+@Composable
+private fun RunBanner(
+    status: RunStatus,
+    onStop: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val c = Kawaii.colors
+    val now by produceState(System.currentTimeMillis()) {
+        while (true) {
+            value = System.currentTimeMillis()
+            delay(1_000)
+        }
+    }
+    val chunked = status.chunksTotal > 0
+    val progress = if (chunked) {
+        (status.chunksDone.toFloat() / status.chunksTotal).coerceIn(0.02f, 1f)
+    } else {
+        status.progress
+    }
+    val eta = if (chunked && status.chunksDone in 1 until status.chunksTotal && status.chunksStartedAtMs > 0) {
+        val perChunk = (now - status.chunksStartedAtMs) / status.chunksDone
+        "~${formatDuration(perChunk * (status.chunksTotal - status.chunksDone))} left"
+    } else {
+        null
+    }
+    KawaiiCard(modifier = modifier, tint = c.sakuraSoft) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Mascot(size = 48.dp, mood = if (status.stopping) Mood.SLEEPY else Mood.YUM, bounce = !status.stopping)
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    if (status.stopping) "Stopping…" else "Translating now",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = c.text,
+                )
+                Text(
+                    status.chapterName,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = c.textSoft,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (!status.stopping) {
+                PillButton("Stop", onClick = onStop, style = PillStyle.GHOST, compact = true)
+            }
+        }
+        Text(status.detail, style = MaterialTheme.typography.bodyMedium, color = c.text)
+        SoftProgressBar(progress, color = c.sakura, track = c.card)
+        Text(
+            listOfNotNull("${formatDuration(now - status.startedAtMs)} elapsed", eta).joinToString(" · "),
+            style = MaterialTheme.typography.bodySmall,
+            color = c.textSoft,
+        )
+    }
+}
+
+private fun formatDuration(ms: Long): String {
+    val totalSeconds = (ms / 1000).coerceAtLeast(0)
+    val hours = totalSeconds / 3600
+    val minutes = (totalSeconds % 3600) / 60
+    val seconds = totalSeconds % 60
+    return when {
+        hours > 0 -> "${hours}h ${minutes}m"
+        minutes > 0 -> "${minutes}m ${seconds}s"
+        else -> "${seconds}s"
+    }
+}
 
 @Composable
 private fun JobCard(

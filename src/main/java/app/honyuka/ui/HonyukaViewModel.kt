@@ -142,6 +142,17 @@ class HonyukaViewModel(
         ContextCompat.registerReceiver(appContext, confirmationReceiver, confirmFilter, ContextCompat.RECEIVER_NOT_EXPORTED)
         refresh()
         refreshLocalModelStatus()
+        viewModelScope.launch {
+            TranslationService.runStatus.collect { status ->
+                _state.update {
+                    it.copy(
+                        runStatus = status,
+                        isBusy = if (status != null) true else it.isBusy,
+                        activeChapterKey = status?.chapterKey ?: it.activeChapterKey,
+                    )
+                }
+            }
+        }
         // Poll model downloads while any is running (DownloadManager has no push updates).
         viewModelScope.launch {
             while (true) {
@@ -415,6 +426,11 @@ class HonyukaViewModel(
             confirmed = true,
         )
         ContextCompat.startForegroundService(appContext, intent)
+    }
+
+    /** Stop button: halts the running translation; finished parts stay saved. */
+    fun stopTranslation() {
+        TranslationService.stop(appContext)
     }
 
     fun cancelTranslation() {
