@@ -57,6 +57,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -240,6 +241,16 @@ private fun HonyukaApp(
                 }
             }
 
+            state.confirmationRequest?.let { request ->
+                item {
+                    ConfirmationDialog(
+                        request = request,
+                        onConfirm = { viewModel.confirmTranslation(request.chapter) },
+                        onCancel = { viewModel.cancelTranslation() },
+                    )
+                }
+            }
+
             if (state.chapters.isEmpty()) {
                 item {
                     EmptyStateCard(hasCompatibleRoot = state.hasCompatibleRoot)
@@ -253,6 +264,7 @@ private fun HonyukaApp(
                             enabled = !state.isBusy,
                             isRunning = state.activeChapterKey == chapter.storageKey,
                             onTranslate = { viewModel.translateChapter(chapter) },
+                            onRerender = { viewModel.reRenderChapter(chapter) },
                         )
                     }
                 }
@@ -288,6 +300,9 @@ private fun HonyukaApp(
             geminiModelName = state.geminiModelName,
             geminiApiKey = state.geminiApiKey,
             deepLApiKey = state.deepLApiKey,
+            apiTestStatus = state.apiTestStatus,
+            availableGeminiModels = state.availableGeminiModels,
+            modelListStatus = state.modelListStatus,
             onPickRoot = onPickRoot,
             onRefresh = viewModel::refresh,
             onSourceSelected = viewModel::onSourceLanguageSelected,
@@ -296,6 +311,8 @@ private fun HonyukaApp(
             onGeminiModelNameChanged = viewModel::onGeminiModelNameChanged,
             onGeminiApiKeyChanged = viewModel::onGeminiApiKeyChanged,
             onDeepLApiKeyChanged = viewModel::onDeepLApiKeyChanged,
+            onTestGeminiApiKey = viewModel::testGeminiApiKey,
+            onRefreshGeminiModels = viewModel::refreshGeminiModels,
             onDismiss = { settingsOpen = false },
         )
     }
@@ -312,6 +329,9 @@ private fun TranslationSettingsDialog(
     geminiModelName: String,
     geminiApiKey: String,
     deepLApiKey: String,
+    apiTestStatus: String?,
+    availableGeminiModels: List<String>,
+    modelListStatus: String?,
     onPickRoot: () -> Unit,
     onRefresh: () -> Unit,
     onSourceSelected: (SourceLanguage) -> Unit,
@@ -320,11 +340,15 @@ private fun TranslationSettingsDialog(
     onGeminiModelNameChanged: (String) -> Unit,
     onGeminiApiKeyChanged: (String) -> Unit,
     onDeepLApiKeyChanged: (String) -> Unit,
+    onTestGeminiApiKey: () -> Unit,
+    onRefreshGeminiModels: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     var modelExpanded by remember { mutableStateOf(false) }
     var targetExpanded by remember { mutableStateOf(false) }
     val selectedPreset = GeminiModelPreset.entries.firstOrNull { it.modelName == geminiModelName }
+    val presetNames = GeminiModelPreset.entries.map { it.modelName }.toSet()
+    val fetchedModels = availableGeminiModels.filterNot { it in presetNames }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -419,9 +443,13 @@ private fun TranslationSettingsDialog(
                 if (translationEngine == TranslationEngine.GEMINI) {
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         Text("Gemini model", style = MaterialTheme.typography.labelLarge)
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
                         Box {
                             Button(onClick = { modelExpanded = true }) {
-                                Text(selectedPreset?.label ?: "Custom model")
+                                Text(selectedPreset?.label ?: geminiModelName.ifBlank { "Custom model" })
                             }
                             DropdownMenu(expanded = modelExpanded, onDismissRequest = { modelExpanded = false }) {
                                 GeminiModelPreset.entries.forEach { preset ->
@@ -442,7 +470,43 @@ private fun TranslationSettingsDialog(
                                         },
                                     )
                                 }
+                                fetchedModels.forEach { model ->
+                                    DropdownMenuItem(
+                                        text = { Text(model) },
+                                        onClick = {
+                                            modelExpanded = false
+                                            onGeminiModelNameChanged(model)
+                                        },
+                                    )
+                                }
                             }
+                        }
+                        TextButton(
+                            onClick = onRefreshGeminiModels,
+                            enabled = geminiApiKey.isNotBlank(),
+                        ) {
+                            Icon(Icons.Outlined.Refresh, contentDescription = null)
+                            Spacer(Modifier.width(4.dp))
+                            Text("Refresh models")
+                        }
+                        }
+                        modelListStatus?.let { status ->
+                            Text(
+                                text = status,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (status.startsWith("❌")) {
+                                    MaterialTheme.colorScheme.error
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                },
+                            )
+                        }
+                        selectedPreset?.let { preset ->
+                            Text(
+                                text = preset.description,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
                         }
                         OutlinedTextField(
                             value = geminiModelName,
@@ -458,6 +522,24 @@ private fun TranslationSettingsDialog(
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                         )
+                        OutlinedButton(
+                            onClick = onTestGeminiApiKey,
+                            enabled = geminiApiKey.isNotBlank(),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(if (apiTestStatus == "Testing\u2026") "Testing\u2026" else "Test API Key")
+                        }
+                        if (apiTestStatus != null && apiTestStatus != "Testing\u2026") {
+                            Text(
+                                text = apiTestStatus,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (apiTestStatus.startsWith("\u2705")) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.error
+                                },
+                            )
+                        }
                     }
                 }
 
@@ -605,6 +687,7 @@ private fun ChapterDirectoryRow(
     enabled: Boolean,
     isRunning: Boolean,
     onTranslate: () -> Unit,
+    onRerender: () -> Unit,
 ) {
     Surface(
         shape = RoundedCornerShape(12.dp),
@@ -641,6 +724,17 @@ private fun ChapterDirectoryRow(
                 text = if (chapter.translated) "Translated" else "New",
                 emphasized = chapter.translated,
             )
+            if (chapter.translated) {
+                TextButton(onClick = onRerender, enabled = enabled) {
+                    Icon(
+                        imageVector = Icons.Outlined.Refresh,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text("Render")
+                }
+            }
             TextButton(onClick = onTranslate, enabled = enabled) {
                 Text(
                     when {
@@ -839,13 +933,44 @@ private fun JobCard(
 private fun MessageCard(message: String) {
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+        modifier = Modifier.fillMaxWidth(),
     ) {
         Text(
             text = message,
-            modifier = Modifier.padding(20.dp),
             color = MaterialTheme.colorScheme.onErrorContainer,
+            modifier = Modifier.padding(16.dp),
         )
     }
+}
+
+@Composable
+private fun ConfirmationDialog(
+    request: app.honyuka.model.ConfirmationRequest,
+    onConfirm: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onCancel,
+        title = { Text("Translation Estimate") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("OCR finished for ${request.chapter.chapterDisplayName}.")
+                Text("Found ${request.blockCount} text blocks.")
+                Text("Translating this will require approximately ${request.chunkCount} API requests to Gemini.")
+                Text("Do you want to proceed and translate?")
+            }
+        },
+        confirmButton = {
+            Button(onClick = onConfirm) {
+                Text("Translate")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onCancel) {
+                Text("Cancel (OCR saved)")
+            }
+        },
+    )
 }
 
 @Composable

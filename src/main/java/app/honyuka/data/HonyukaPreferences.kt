@@ -45,9 +45,28 @@ class HonyukaPreferences(context: Context) {
     }
 
     fun geminiModelName(): String {
-        return prefs.getString(KEY_GEMINI_MODEL_NAME, GeminiModelPreset.GEMINI_2_5_FLASH.modelName)
-            ?.takeIf { it.isNotBlank() }
-            ?: GeminiModelPreset.GEMINI_2_5_FLASH.modelName
+        val saved = prefs.getString(KEY_GEMINI_MODEL_NAME, null)?.trim()
+        // One-time migration: move users off presets from older builds. Done once so a
+        // model the user later picks from the fetched list is never overridden.
+        if (!prefs.getBoolean(KEY_MODEL_PRESETS_MIGRATED, false)) {
+            prefs.edit().putBoolean(KEY_MODEL_PRESETS_MIGRATED, true).apply()
+            if (saved != null && saved in GeminiModelPreset.RETIRED_MODEL_NAMES) {
+                saveGeminiModelName(GeminiModelPreset.DEFAULT.modelName)
+                return GeminiModelPreset.DEFAULT.modelName
+            }
+        }
+        return saved?.takeIf { it.isNotBlank() } ?: GeminiModelPreset.DEFAULT.modelName
+    }
+
+    fun availableGeminiModels(): List<String> {
+        return prefs.getString(KEY_GEMINI_MODEL_LIST, null)
+            ?.split('\n')
+            ?.filter { it.isNotBlank() }
+            .orEmpty()
+    }
+
+    fun saveAvailableGeminiModels(models: List<String>) {
+        prefs.edit().putString(KEY_GEMINI_MODEL_LIST, models.joinToString("\n")).apply()
     }
 
     fun saveGeminiModelName(modelName: String) {
@@ -73,6 +92,8 @@ class HonyukaPreferences(context: Context) {
         const val KEY_TRANSLATION_ENGINE = "translation_engine"
         const val KEY_GEMINI_MODEL_NAME = "gemini_model_name"
         const val KEY_GEMINI_API_KEY = "gemini_api_key"
+        const val KEY_GEMINI_MODEL_LIST = "gemini_model_list"
+        const val KEY_MODEL_PRESETS_MIGRATED = "model_presets_migrated_v2"
         const val KEY_DEEPL_API_KEY = "deepl_api_key"
     }
 }

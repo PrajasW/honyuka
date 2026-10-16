@@ -49,21 +49,38 @@ enum class GeminiModelPreset(
     val modelName: String,
     val description: String,
 ) {
-    GEMINI_2_5_FLASH(
-        label = "Gemini 2.5 Flash",
-        modelName = "gemini-2.5-flash",
-        description = "Fast, cheap, excellent for manga dialogue — recommended default",
+    // `-latest` aliases are maintained by Google and always point at the newest
+    // model in each tier, so these presets don't go stale between releases.
+    FLASH_LITE_LATEST(
+        label = "Flash-Lite (latest)",
+        modelName = "gemini-flash-lite-latest",
+        description = "Cheapest, largest free daily quota — recommended for manga dialogue",
     ),
-    GEMINI_2_5_PRO(
-        label = "Gemini 2.5 Pro",
-        modelName = "gemini-2.5-pro",
-        description = "Higher quality for nuanced translations, slower and more expensive",
+    FLASH_LATEST(
+        label = "Flash (latest)",
+        modelName = "gemini-flash-latest",
+        description = "Better nuance, smaller free quota",
     ),
-    GEMINI_3_FLASH_PREVIEW(
-        label = "Gemini 3 Flash Preview",
-        modelName = "gemini-3-flash-preview",
-        description = "Latest preview model — experimental",
+    PRO_LATEST(
+        label = "Pro (latest)",
+        modelName = "gemini-pro-latest",
+        description = "Highest quality, slowest and most expensive — little or no free quota",
     ),
+    ;
+
+    companion object {
+        val DEFAULT = FLASH_LITE_LATEST
+
+        /** Hard-coded model names shipped by older builds; migrated to [DEFAULT]. */
+        val RETIRED_MODEL_NAMES = setOf(
+            "gemini-2.0-flash",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-2.5-pro",
+            "gemini-3-flash-preview",
+            "gemini-3.5-flash",
+        )
+    }
 }
 
 data class ChapterEntry(
@@ -91,7 +108,9 @@ data class HonyukaUiState(
     val sourceLanguage: SourceLanguage = SourceLanguage.JAPANESE,
     val targetLanguage: TargetLanguage = TargetLanguage.ENGLISH,
     val translationEngine: TranslationEngine = TranslationEngine.GEMINI,
-    val geminiModelName: String = GeminiModelPreset.GEMINI_2_5_FLASH.modelName,
+    val geminiModelName: String = GeminiModelPreset.DEFAULT.modelName,
+    val availableGeminiModels: List<String> = emptyList(),
+    val modelListStatus: String? = null,
     val geminiApiKey: String = "",
     val deepLApiKey: String = "",
     val chapters: List<ChapterEntry> = emptyList(),
@@ -99,6 +118,14 @@ data class HonyukaUiState(
     val activeChapterKey: String? = null,
     val isBusy: Boolean = false,
     val message: String? = null,
+    val apiTestStatus: String? = null,
+    val confirmationRequest: ConfirmationRequest? = null,
+)
+
+data class ConfirmationRequest(
+    val chapter: ChapterEntry,
+    val chunkCount: Int,
+    val blockCount: Int,
 )
 
 @Serializable

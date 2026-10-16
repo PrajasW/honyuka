@@ -29,7 +29,12 @@ class HonyukaStorage(
     fun scanChapters(): List<ChapterEntry> {
         val root = rootDirectory() ?: return emptyList()
         val downloadsDir = root.findFile(DOWNLOADS_DIR) ?: return emptyList()
-        val translationsDir = root.findFile(TRANSLATIONS_DIR)
+        // List the local source once instead of a findFile() per chapter (slow over SAF).
+        val exportedByManga = root.findFile(LOCAL_SOURCE_DIR)
+            ?.listFiles()
+            ?.filter { it.isDirectory && it.name != null }
+            ?.associate { dir -> dir.name!! to dir.listFiles().mapNotNull { it.name }.toSet() }
+            .orEmpty()
 
         return downloadsDir.listFiles()
             .filter { it.isDirectory && !it.name.isNullOrBlank() }
@@ -39,6 +44,7 @@ class HonyukaStorage(
                     .filter { it.isDirectory && !it.name.isNullOrBlank() }
                     .sortedByNaturalName()
                     .flatMap { mangaDir ->
+                        val exported = exportedByManga[localMangaDirName(mangaDir.name!!)].orEmpty()
                         mangaDir.listFiles()
                             .filter { isVisibleChapterContainer(it) }
                             .sortedByNaturalName()
@@ -52,18 +58,7 @@ class HonyukaStorage(
                                     chapterUri = chapterFile.uri,
                                     thumbnailUri = chapterThumbnailUri(chapterFile),
                                     isCbz = chapterFile.isFile,
-                                    translated = resolveTranslatedChapterDocument(
-                                        sourceName = sourceDir.name!!,
-                                        mangaName = mangaDir.name!!,
-                                        chapterBaseName = baseName,
-                                        isCbz = chapterFile.isFile,
-                                    )?.exists() == true ||
-                                        translationFileFor(
-                                            translationsDir = translationsDir,
-                                            sourceName = sourceDir.name!!,
-                                            mangaName = mangaDir.name!!,
-                                            chapterBaseName = baseName,
-                                        )?.exists() == true,
+                                    translated = localChapterFileNames(baseName).any { it in exported },
                                 )
                             }
                     }
@@ -90,78 +85,68 @@ class HonyukaStorage(
             .firstOrNull()
     }
 
-    fun resolveInputChapterDocument(chapter: ChapterEntry): DocumentFile? {
-        return resolveBackupChapterDocument(chapter) ?: resolveChapterDocument(chapter)
-    }
-
     fun resolveOriginalChapterDocument(chapter: ChapterEntry): DocumentFile? {
         return resolveChapterDocument(chapter)
     }
 
-    fun prepareTranslatedChapterDocument(chapter: ChapterEntry): DocumentFile {
-        val root = requireNotNull(rootDirectory()) { "Storage root is not configured." }
-        val mangaDir = root.findFile(DOWNLOADS_DIR)
-            ?.findFile(chapter.sourceName)
-            ?.findFile(chapter.mangaName)
-        requireNotNull(mangaDir) { "Unable to locate manga downloads directory." }
-
-        resolveTranslatedChapterDocument(chapter)?.let { existing ->
-            deleteRecursively(existing)
-        }
-
-        val translatedName = translatedChapterName(chapter.chapterBaseName)
-        return if (chapter.isCbz) {
-            mangaDir.createFile("application/vnd.comicbook+zip", "$translatedName.cbz")
-                ?: error("Unable to create translated chapter archive.")
-        } else {
-            mangaDir.createDirectory(translatedName)
-                ?: error("Unable to create translated chapter folder.")
-        }
-    }
-
-    fun prepareLocalSourceExportTarget(
-        chapter: ChapterEntry,
-    ): DocumentFile {
+    /** `local/<manga> (Honyuka)/`, created if needed. Mihon's Local Source lists each folder here as a manga. */
+    fun localSourceMangaDirectory(chapter: ChapterEntry): DocumentFile {
         val root = requireNotNull(rootDirectory()) { "Storage root is not configured." }
         val localRoot = root.findFile(LOCAL_SOURCE_DIR) ?: root.createDirectory(LOCAL_SOURCE_DIR)
         requireNotNull(localRoot) { "Unable to locate or create the local source root." }
 
-        val mangaDirName = buildValidFilename("${chapter.mangaName} (Honyuka)")
+        val mangaDirName = localMangaDirName(chapter.mangaName)
         val mangaDir = localRoot.findFile(mangaDirName) ?: localRoot.createDirectory(mangaDirName)
-        requireNotNull(mangaDir) { "Unable to create local source manga directory." }
+        return requireNotNull(mangaDir) { "Unable to create local source manga directory." }
+    }
 
-        val chapterFileName = "${buildValidFilename("${chapter.chapterBaseName}$TRANSLATED_SUFFIX")}.cbz"
-        mangaDir.findFile(chapterFileName)?.delete()
-        return mangaDir.createFile("application/vnd.comicbook+zip", chapterFileName)
+    /** Title shown in Mihon for the translated copy (also the local folder name). */
+    fun localSeriesTitle(chapter: ChapterEntry): String = localMangaDirName(chapter.mangaName)
+
+    /**
+     * Creates (replacing any previous export) `local/<manga> (Honyuka)/<chapter>.cbz`.
+     * Exports from older builds named `<chapter>_translated.cbz` are removed so Mihon
+     * doesn't list the chapter twice.
+     */
+    fun prepareLocalSourceExportTarget(chapter: ChapterEntry): DocumentFile {
+        val mangaDir = localSourceMangaDirectory(chapter)
+        val names = localChapterFileNames(chapter.chapterBaseName)
+        names.forEach { name -> mangaDir.findFile(name)?.delete() }
+        // octet-stream keeps the file name exactly as given; some providers rewrite
+        // the extension for comic-book MIME types.
+        return mangaDir.createFile("application/octet-stream", names.first())
             ?: error("Unable to create local source export archive.")
     }
 
-    fun ensureOriginalChapterBackup(chapter: ChapterEntry): DocumentFile {
-        resolveBackupChapterDocument(chapter)?.let { return it }
-
-        val liveChapter = requireNotNull(resolveChapterDocument(chapter)) {
-            "Unable to locate the live chapter in downloads."
+    /** Writes (or overwrites) [fileName] in the local manga folder. */
+    fun writeLocalMangaFile(chapter: ChapterEntry, fileName: String, bytes: ByteArray) {
+        val mangaDir = localSourceMangaDirectory(chapter)
+        val file = mangaDir.findFile(fileName)
+            ?: mangaDir.createFile("application/octet-stream", fileName)
+            ?: error("Unable to create $fileName in the local source folder.")
+        context.contentResolver.openOutputStream(file.uri, "wt").use { output ->
+            requireNotNull(output) { "Unable to write $fileName." }
+            output.write(bytes)
         }
-        val root = requireNotNull(rootDirectory()) { "Storage root is not configured." }
-        val mangaDir = root.findFile(DOWNLOADS_DIR)
-            ?.findFile(chapter.sourceName)
-            ?.findFile(chapter.mangaName)
-        requireNotNull(mangaDir) { "Unable to locate manga downloads directory." }
+    }
 
-        val backupRoot = mangaDir.findFile(BACKUPS_DIR) ?: mangaDir.createDirectory(BACKUPS_DIR)
-        requireNotNull(backupRoot) { "Unable to create per-manga backup directory." }
+    /** Writes [fileName] into the local manga folder only if it doesn't exist yet. */
+    fun writeLocalMangaFileIfMissing(
+        chapter: ChapterEntry,
+        fileName: String,
+        bytes: () -> ByteArray?,
+    ) {
+        val mangaDir = localSourceMangaDirectory(chapter)
+        if (mangaDir.findFile(fileName) != null) return
+        val content = bytes() ?: return
+        val file = mangaDir.createFile("application/octet-stream", fileName) ?: return
+        context.contentResolver.openOutputStream(file.uri, "wt")?.use { it.write(content) }
+    }
 
-        return if (chapter.isCbz) {
-            val backupName = "${chapter.chapterBaseName}.cbz"
-            val file = backupRoot.createFile("application/vnd.comicbook+zip", backupName)
-                ?: error("Unable to create chapter backup archive.")
-            copyFileContents(liveChapter, file)
-            file
-        } else {
-            val folder = backupRoot.createDirectory(chapter.chapterBaseName)
-                ?: error("Unable to create chapter backup folder.")
-            copyDirectoryContents(liveChapter, folder)
-            folder
+    /** Mihon uses any `cover.*` image in the manga folder. */
+    fun hasLocalCover(chapter: ChapterEntry): Boolean {
+        return localSourceMangaDirectory(chapter).listFiles().any { file ->
+            file.isFile && file.name.orEmpty().substringBeforeLast('.').equals("cover", ignoreCase = true)
         }
     }
 
@@ -188,6 +173,30 @@ class HonyukaStorage(
         }
     }
 
+    /**
+     * Load a previously saved translation sidecar for the given chapter.
+     * Returns null if no sidecar exists.
+     */
+    fun readTranslation(chapter: ChapterEntry): Map<String, PageTranslation>? {
+        val root = rootDirectory() ?: return null
+        val translationsDir = root.findFile(TRANSLATIONS_DIR) ?: return null
+        val file = translationFileFor(
+            translationsDir = translationsDir,
+            sourceName = chapter.sourceName,
+            mangaName = chapter.mangaName,
+            chapterBaseName = chapter.chapterBaseName,
+        ) ?: return null
+        if (!file.exists()) return null
+        return try {
+            val jsonText = context.contentResolver.openInputStream(file.uri)?.use { input ->
+                input.bufferedReader(Charsets.UTF_8).readText()
+            } ?: return null
+            Json.decodeFromString<Map<String, PageTranslation>>(jsonText)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     private fun rootDirectory(): DocumentFile? {
         val rootUri = preferences.rootUri() ?: return null
         return DocumentFile.fromTreeUri(context, rootUri)
@@ -205,111 +214,6 @@ class HonyukaStorage(
             ?.findFile("${buildValidFilename(chapterBaseName)}.json")
     }
 
-    fun resolveTranslatedChapterDocument(chapter: ChapterEntry): DocumentFile? {
-        return resolveTranslatedChapterDocument(
-            sourceName = chapter.sourceName,
-            mangaName = chapter.mangaName,
-            chapterBaseName = chapter.chapterBaseName,
-            isCbz = chapter.isCbz,
-        )
-    }
-
-    private fun resolveTranslatedChapterDocument(
-        sourceName: String,
-        mangaName: String,
-        chapterBaseName: String,
-        isCbz: Boolean,
-    ): DocumentFile? {
-        val root = rootDirectory() ?: return null
-        val mangaDir = root.findFile(DOWNLOADS_DIR)
-            ?.findFile(sourceName)
-            ?.findFile(mangaName)
-            ?: return null
-
-        val translatedName = translatedChapterName(chapterBaseName)
-        val candidates = buildList {
-            add(translatedName)
-            if (isCbz) add("$translatedName.cbz")
-        }
-        return candidates.asSequence().mapNotNull(mangaDir::findFile).firstOrNull()
-    }
-
-    private fun resolveBackupChapterDocument(chapter: ChapterEntry): DocumentFile? {
-        val root = rootDirectory() ?: return null
-        val mangaDir = root.findFile(DOWNLOADS_DIR)
-            ?.findFile(chapter.sourceName)
-            ?.findFile(chapter.mangaName)
-            ?.findFile(BACKUPS_DIR)
-            ?: return null
-
-        val backupNames = buildList {
-            add(chapter.chapterBaseName)
-            if (chapter.isCbz) add("${chapter.chapterBaseName}.cbz")
-        }
-
-        return backupNames
-            .asSequence()
-            .mapNotNull(mangaDir::findFile)
-            .firstOrNull()
-            ?: resolveLegacyBackupChapterDocument(root, chapter)
-    }
-
-    private fun resolveLegacyBackupChapterDocument(
-        root: DocumentFile,
-        chapter: ChapterEntry,
-    ): DocumentFile? {
-        val mangaDir = root.findFile(LEGACY_BACKUPS_DIR)
-            ?.findFile(DOWNLOADS_DIR)
-            ?.findFile(chapter.sourceName)
-            ?.findFile(chapter.mangaName)
-            ?: return null
-
-        val backupNames = buildList {
-            add(chapter.chapterBaseName)
-            if (chapter.isCbz) add("${chapter.chapterBaseName}.cbz")
-        }
-
-        return backupNames
-            .asSequence()
-            .mapNotNull(mangaDir::findFile)
-            .firstOrNull()
-    }
-
-    private fun copyDirectoryContents(source: DocumentFile, destination: DocumentFile) {
-        source.listFiles().forEach { child ->
-            when {
-                child.isDirectory -> {
-                    val targetDir = destination.findFile(child.name.orEmpty())
-                        ?: destination.createDirectory(child.name.orEmpty())
-                    requireNotNull(targetDir) { "Unable to create backup subdirectory ${child.name.orEmpty()}." }
-                    copyDirectoryContents(child, targetDir)
-                }
-                child.isFile -> {
-                    val targetFile = destination.createFile(child.type ?: "application/octet-stream", child.name.orEmpty())
-                        ?: error("Unable to create backup file ${child.name.orEmpty()}.")
-                    copyFileContents(child, targetFile)
-                }
-            }
-        }
-    }
-
-    private fun copyFileContents(source: DocumentFile, destination: DocumentFile) {
-        context.contentResolver.openInputStream(source.uri).use { input ->
-            requireNotNull(input) { "Unable to open source file ${source.name.orEmpty()}." }
-            context.contentResolver.openOutputStream(destination.uri, "wt").use { output ->
-                requireNotNull(output) { "Unable to open destination file ${destination.name.orEmpty()}." }
-                input.copyTo(output)
-            }
-        }
-    }
-
-    private fun deleteRecursively(file: DocumentFile) {
-        if (file.isDirectory) {
-            file.listFiles().forEach(::deleteRecursively)
-        }
-        file.delete()
-    }
-
     private fun isSupportedChapterContainer(file: DocumentFile): Boolean {
         val name = file.name?.lowercase(Locale.ROOT) ?: return false
         return file.isDirectory || (file.isFile && name.endsWith(".cbz"))
@@ -319,7 +223,12 @@ class HonyukaStorage(
         if (!isSupportedChapterContainer(file)) return false
         val name = file.name.orEmpty()
         val baseName = name.removeSuffix(".cbz")
-        return baseName != BACKUPS_DIR && !baseName.endsWith(TRANSLATED_SUFFIX)
+        // Mihon writes in-progress downloads to `<chapter>_tmp` / `<chapter>.cbz_tmp`
+        // and ignores them; so do we. Hidden entries are never chapters.
+        return !name.startsWith(".") &&
+            !name.endsWith("_tmp") &&
+            baseName != BACKUPS_DIR &&
+            !baseName.endsWith(TRANSLATED_SUFFIX)
     }
 
     private fun chapterThumbnailUri(chapterFile: DocumentFile): Uri? {
@@ -351,11 +260,19 @@ class HonyukaStorage(
             lowered.endsWith(".avif")
     }
 
-    private fun translatedChapterName(originalBaseName: String): String {
-        return "$originalBaseName$TRANSLATED_SUFFIX"
+    private fun localMangaDirName(mangaName: String): String = buildValidFilename("$mangaName (Honyuka)")
+
+    /** Current export name first, then the `_translated` name used by older builds. */
+    private fun localChapterFileNames(chapterBaseName: String): List<String> {
+        val maxBaseBytes = MAX_FILE_NAME_BYTES - ".cbz".length - TRANSLATED_SUFFIX.length
+        return listOf(
+            "${buildValidFilename(chapterBaseName, maxBaseBytes)}.cbz",
+            "${buildValidFilename("$chapterBaseName$TRANSLATED_SUFFIX", maxBaseBytes + TRANSLATED_SUFFIX.length)}.cbz",
+        )
     }
 
-    private fun buildValidFilename(original: String): String {
+    /** Mirrors Mihon's `DiskUtil.buildValidFilename`, including its UTF-8 byte limit. */
+    private fun buildValidFilename(original: String, maxBytes: Int = MAX_FILE_NAME_BYTES): String {
         val trimmed = original.trim('.', ' ')
         if (trimmed.isEmpty()) return "(invalid)"
         val builder = StringBuilder(trimmed.length)
@@ -365,7 +282,21 @@ class HonyukaStorage(
                 character.code != 127
             builder.append(if (isAllowed) character else '_')
         }
-        return builder.toString().take(240)
+        return truncateToUtf8Bytes(builder.toString(), maxBytes).ifEmpty { "(invalid)" }
+    }
+
+    private fun truncateToUtf8Bytes(value: String, maxBytes: Int): String {
+        if (value.toByteArray(Charsets.UTF_8).size <= maxBytes) return value
+        var bytes = 0
+        var end = 0
+        while (end < value.length) {
+            val codePoint = value.codePointAt(end)
+            val size = String(Character.toChars(codePoint)).toByteArray(Charsets.UTF_8).size
+            if (bytes + size > maxBytes) break
+            bytes += size
+            end += Character.charCount(codePoint)
+        }
+        return value.substring(0, end)
     }
 
     private companion object {
@@ -373,8 +304,8 @@ class HonyukaStorage(
         const val LOCAL_SOURCE_DIR = "local"
         const val TRANSLATIONS_DIR = "translations"
         const val BACKUPS_DIR = "__honyuka_backup__"
-        const val LEGACY_BACKUPS_DIR = "honyuka_backups"
         const val TRANSLATED_SUFFIX = "_translated"
+        const val MAX_FILE_NAME_BYTES = 240
     }
 }
 

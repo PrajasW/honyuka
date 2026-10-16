@@ -33,3 +33,9 @@ Thumbs.db
 *.apk
 *.aar
 *.ap_
+
+backend-reference/
+*.cbz
+
+# Secrets
+.env

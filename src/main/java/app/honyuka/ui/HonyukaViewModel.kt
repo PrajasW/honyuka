@@ -17,11 +17,15 @@ import app.honyuka.data.HonyukaPreferences
 import app.honyuka.data.HonyukaStorage
 import app.honyuka.model.ActiveJob
 import app.honyuka.model.ChapterEntry
+import app.honyuka.model.ConfirmationRequest
 import app.honyuka.model.HonyukaUiState
 import app.honyuka.model.SourceLanguage
 import app.honyuka.model.TargetLanguage
 import app.honyuka.model.TranslationEngine
 import app.honyuka.service.TranslationService
+import app.honyuka.translation.GeminiTestResult
+import app.honyuka.translation.fetchGeminiModels
+import app.honyuka.translation.testGeminiConnection
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -45,6 +49,7 @@ class HonyukaViewModel(
             targetLanguage = preferences.targetLanguage(),
             translationEngine = preferences.translationEngine(),
             geminiModelName = preferences.geminiModelName(),
+            availableGeminiModels = preferences.availableGeminiModels(),
             geminiApiKey = preferences.geminiApiKey(),
             deepLApiKey = preferences.deepLApiKey(),
         ),
@@ -97,17 +102,42 @@ class HonyukaViewModel(
         }
     }
 
+    private val confirmationReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val storageKey = intent.getStringExtra(TranslationService.EXTRA_STORAGE_KEY) ?: return
+            val chunks = intent.getIntExtra(TranslationService.EXTRA_CHUNK_COUNT, 0)
+            val blocks = intent.getIntExtra(TranslationService.EXTRA_BLOCK_COUNT, 0)
+            
+            val chapter = _state.value.chapters.find { it.storageKey == storageKey }
+            if (chapter == null) {
+                _state.update {
+                    it.copy(isBusy = false, activeChapterKey = null, activeJob = null, message = "Chapter list changed — try again.")
+                }
+                return
+            }
+            _state.update {
+                it.copy(
+                    confirmationRequest = ConfirmationRequest(chapter, chunks, blocks),
+                    activeJob = ActiveJob("Waiting for confirmation", "OCR completed", 0.65f),
+                )
+            }
+        }
+    }
+
     init {
         val progressFilter = IntentFilter(TranslationService.ACTION_PROGRESS)
         val resultFilter = IntentFilter(TranslationService.ACTION_RESULT)
+        val confirmFilter = IntentFilter(TranslationService.ACTION_REQUIRE_CONFIRMATION)
         ContextCompat.registerReceiver(appContext, progressReceiver, progressFilter, ContextCompat.RECEIVER_NOT_EXPORTED)
         ContextCompat.registerReceiver(appContext, resultReceiver, resultFilter, ContextCompat.RECEIVER_NOT_EXPORTED)
+        ContextCompat.registerReceiver(appContext, confirmationReceiver, confirmFilter, ContextCompat.RECEIVER_NOT_EXPORTED)
         refresh()
     }
 
     override fun onCleared() {
         appContext.unregisterReceiver(progressReceiver)
         appContext.unregisterReceiver(resultReceiver)
+        appContext.unregisterReceiver(confirmationReceiver)
         super.onCleared()
     }
 
@@ -140,17 +170,56 @@ class HonyukaViewModel(
 
     fun onGeminiModelNameChanged(modelName: String) {
         preferences.saveGeminiModelName(modelName)
-        _state.update { it.copy(geminiModelName = modelName) }
+        _state.update { it.copy(geminiModelName = modelName, apiTestStatus = null) }
     }
 
     fun onGeminiApiKeyChanged(apiKey: String) {
         preferences.saveGeminiApiKey(apiKey)
-        _state.update { it.copy(geminiApiKey = apiKey) }
+        _state.update { it.copy(geminiApiKey = apiKey, apiTestStatus = null) }
     }
 
     fun onDeepLApiKeyChanged(apiKey: String) {
         preferences.saveDeepLApiKey(apiKey)
         _state.update { it.copy(deepLApiKey = apiKey) }
+    }
+
+    fun testGeminiApiKey() {
+        val currentState = state.value
+        _state.update { it.copy(apiTestStatus = "Testing…") }
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                testGeminiConnection(
+                    apiKey = currentState.geminiApiKey,
+                    modelName = currentState.geminiModelName,
+                )
+            }
+            val statusText = when (result) {
+                is GeminiTestResult.Success ->
+                    "✅ Working — \"おい待て\" → \"${result.translatedText}\""
+                is GeminiTestResult.Failure ->
+                    "❌ Failed — ${result.message}"
+            }
+            _state.update { it.copy(apiTestStatus = statusText) }
+        }
+    }
+
+    fun refreshGeminiModels() {
+        val apiKey = state.value.geminiApiKey
+        _state.update { it.copy(modelListStatus = "Loading models…") }
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) { fetchGeminiModels(apiKey) }
+            result.onSuccess { models ->
+                preferences.saveAvailableGeminiModels(models)
+                _state.update {
+                    it.copy(
+                        availableGeminiModels = models,
+                        modelListStatus = "${models.size} models available for this key",
+                    )
+                }
+            }.onFailure { error ->
+                _state.update { it.copy(modelListStatus = "❌ ${error.message ?: "Could not load models"}") }
+            }
+        }
     }
 
     fun refresh() {
@@ -224,6 +293,64 @@ class HonyukaViewModel(
 
         Log.d(TAG, "Starting translation service for ${chapter.storageKey}")
         Toast.makeText(appContext, "Starting translation for ${chapter.chapterDisplayName}", Toast.LENGTH_SHORT).show()
+        _state.update {
+            it.copy(
+                isBusy = true,
+                activeChapterKey = chapter.storageKey,
+                activeJob = ActiveJob("Starting", "Initialising translation engine", 0f),
+            )
+        }
+        val intent = TranslationService.buildIntent(
+            context = appContext,
+            chapter = chapter,
+            sourceLanguage = currentState.sourceLanguage,
+            targetLanguage = currentState.targetLanguage,
+            translationEngine = currentState.translationEngine,
+            geminiApiKey = currentState.geminiApiKey,
+            geminiModelName = currentState.geminiModelName,
+            deepLApiKey = currentState.deepLApiKey,
+            confirmed = false,
+        )
+        ContextCompat.startForegroundService(appContext, intent)
+    }
+
+    fun confirmTranslation(chapter: ChapterEntry) {
+        val currentState = state.value
+        _state.update {
+            it.copy(
+                confirmationRequest = null,
+                activeJob = ActiveJob("Resuming", "Sending translation requests to Gemini", 0.65f),
+            )
+        }
+        val intent = TranslationService.buildIntent(
+            context = appContext,
+            chapter = chapter,
+            sourceLanguage = currentState.sourceLanguage,
+            targetLanguage = currentState.targetLanguage,
+            translationEngine = currentState.translationEngine,
+            geminiApiKey = currentState.geminiApiKey,
+            geminiModelName = currentState.geminiModelName,
+            deepLApiKey = currentState.deepLApiKey,
+            confirmed = true,
+        )
+        ContextCompat.startForegroundService(appContext, intent)
+    }
+
+    fun cancelTranslation() {
+        _state.update {
+            it.copy(
+                confirmationRequest = null,
+                isBusy = false,
+                activeChapterKey = null,
+                activeJob = null,
+                message = "Translation cancelled. OCR results were saved to disk.",
+            )
+        }
+    }
+
+    fun reRenderChapter(chapter: ChapterEntry) {
+        Log.d(TAG, "Starting re-render service for ${chapter.storageKey}")
+        Toast.makeText(appContext, "Re-rendering ${chapter.chapterDisplayName}", Toast.LENGTH_SHORT).show()
 
         _state.update {
             it.copy(
@@ -231,22 +358,16 @@ class HonyukaViewModel(
                 message = null,
                 activeChapterKey = chapter.storageKey,
                 activeJob = ActiveJob(
-                    title = "Starting translation",
+                    title = "Re-rendering",
                     detail = chapter.chapterDisplayName,
                     progress = 0.02f,
                 ),
             )
         }
 
-        val serviceIntent = TranslationService.buildIntent(
+        val serviceIntent = TranslationService.buildRerenderIntent(
             context = appContext,
             chapter = chapter,
-            sourceLanguage = currentState.sourceLanguage,
-            targetLanguage = currentState.targetLanguage,
-            translationEngine = translationEngine,
-            geminiApiKey = currentState.geminiApiKey,
-            geminiModelName = currentState.geminiModelName,
-            deepLApiKey = currentState.deepLApiKey,
         )
         ContextCompat.startForegroundService(appContext, serviceIntent)
     }

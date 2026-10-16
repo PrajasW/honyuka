@@ -30,7 +30,7 @@ Honyuka offers several configuration options to customize your translation exper
   - **Gemini:** Cloud-based translation using Google's Gemini models for highly contextual and accurate translations. Requires an API Key.
   - **ML Kit:** On-device, offline translation provided by Google. Fast and private, but may have lower contextual quality.
   - **DeepL:** High-quality neural machine translation. Requires an API Key.
-- **Gemini Model:** Allows you to specify the exact Gemini model to use (e.g., `gemini-2.5-flash`).
+- **Gemini Model:** Defaults to `gemini-flash-lite-latest` (cheapest, largest free quota). Tap **Refresh models** to list every model your key can use, or type any model name.
 - **API Keys:** Secure fields to enter your respective Gemini and DeepL API keys.
 
 This folder is now its own Android project. You can open `honyuka/` directly in Android Studio or build it from inside this folder without using the parent repo's Gradle setup.
@@ -54,26 +54,23 @@ Pick the same root folder the reader uses, with this structure:
 translations/<source>/<manga>/<chapter>.json
 ```
 
-It also renders translated pages into a separate sibling chapter so a normal Mihon install can open the translated result directly without replacing the original chapter. The translated export is created as:
+It renders the translated pages into Mihon's Local Source:
 
 ```text
-downloads/<source>/<manga>/<chapter>_translated
-downloads/<source>/<manga>/<chapter>_translated.cbz
+local/<manga name> (Honyuka)/
+  ComicInfo.xml        # Series = "<manga name> (Honyuka)"
+  cover.jpg            # first translated page, written once
+  <chapter>.cbz        # rendered pages + ComicInfo.xml (title/number kept, Translator credited)
 ```
 
-Because regular Mihon does not create new chapter entries for arbitrary extra files under an online-source manga, Honyuka also exports a discoverable copy to the Local Source as:
+In Mihon, open **Browse → Local source** (pull to refresh) to read it. Original downloads are never modified, and in-progress downloads (`*_tmp`) are ignored.
 
-```text
-local/<manga name> (Honyuka)/<chapter>_translated.cbz
-```
+### Keeping API usage low
 
-After refreshing the Local Source in Mihon, the translated chapter should appear there.
-
-If needed, Honyuka can still keep an original backup alongside the manga's downloaded chapters under:
-
-```text
-downloads/<source>/<manga>/__honyuka_backup__/<chapter-or-cbz>
-```
+- Only untranslated lines are sent; translating a chapter again sends nothing.
+- Repeated lines are sent once, and lines seen in earlier chapters come from an on-device translation memory.
+- Progress is saved after every request, so if the quota runs out you only resend what is left.
+- Most chapters take a single Gemini request; model "thinking" is turned down to the minimum, since thinking tokens are billed.
 
 ## Current Feature Set
 
@@ -89,5 +86,5 @@ downloads/<source>/<manga>/__honyuka_backup__/<chapter-or-cbz>
 
 ```powershell
 cd honyuka
-.\gradlew.bat assembleRelease
+.\gradlew.bat assembleRelease ; .\gradlew.bat installRelease
 ```

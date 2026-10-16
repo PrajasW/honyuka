@@ -18,6 +18,7 @@ import app.honyuka.data.HonyukaPreferences
 import app.honyuka.data.HonyukaStorage
 import app.honyuka.export.RenderedChapterExporter
 import app.honyuka.model.ChapterEntry
+import app.honyuka.model.PageTranslation
 import app.honyuka.model.SourceLanguage
 import app.honyuka.model.TargetLanguage
 import app.honyuka.model.TranslationEngine
@@ -57,14 +58,19 @@ class TranslationService : Service() {
             ?.let { name -> TranslationEngine.entries.firstOrNull { it.name == name } }
             ?: TranslationEngine.GEMINI
         val geminiApiKey = intent.getStringExtra(EXTRA_GEMINI_API_KEY).orEmpty()
-        val geminiModelName = intent.getStringExtra(EXTRA_GEMINI_MODEL).orEmpty()
-        val deepLApiKey = intent.getStringExtra(EXTRA_DEEPL_API_KEY).orEmpty()
+        val geminiModelName = intent.getStringExtra(EXTRA_GEMINI_MODEL) ?: ""
+        val deepLApiKey = intent.getStringExtra(EXTRA_DEEPL_API_KEY) ?: ""
+        val rerenderOnly = intent.getBooleanExtra(EXTRA_RERENDER_ONLY, false)
+        val isConfirmed = intent.getBooleanExtra(EXTRA_CONFIRMED, false)
 
-        startForeground(NOTIFICATION_ID, buildNotification("Starting…", chapter.chapterDisplayName, 0))
+        startForeground(NOTIFICATION_ID, buildNotification(
+            if (rerenderOnly) "Re-rendering…" else "Starting…",
+            chapter.chapterDisplayName, 0,
+        ))
 
         translationJob?.cancel()
         translationJob = scope.launch {
-            runTranslation(chapter, sourceLang, targetLang, engine, geminiApiKey, geminiModelName, deepLApiKey)
+            runTranslation(chapter, sourceLang, targetLang, engine, geminiApiKey, geminiModelName, deepLApiKey, rerenderOnly, isConfirmed)
         }
 
         return START_NOT_STICKY
@@ -78,6 +84,8 @@ class TranslationService : Service() {
         geminiApiKey: String,
         geminiModelName: String,
         deepLApiKey: String,
+        rerenderOnly: Boolean,
+        isConfirmed: Boolean,
     ) {
         val preferences = HonyukaPreferences(this)
         val storage = HonyukaStorage(this, preferences)
@@ -94,28 +102,87 @@ class TranslationService : Service() {
                 return
             }
 
-            val translations = pipeline.translateChapter(
-                chapter = chapter,
-                chapterDocument = chapterDocument,
-                sourceLanguage = sourceLanguage,
-                targetLanguage = targetLanguage,
-                translationEngine = translationEngine,
-                geminiApiKey = geminiApiKey,
-                geminiModelName = geminiModelName,
-                deepLApiKey = deepLApiKey,
-            ) { title, detail, progress ->
-                updateNotification(title, detail, (progress * 100).toInt())
-                broadcastProgress(chapter, title, detail, progress)
+            val saved = storage.readTranslation(chapter)
+            var translations = saved
+
+            val hasValidSidecar = !saved.isNullOrEmpty() && saved.values.any { it.blocks.isNotEmpty() }
+
+            if (rerenderOnly) {
+                updateNotification("Loading translations", chapter.chapterDisplayName, 10)
+                broadcastProgress(chapter, "Loading translations", "Reading saved translation data", 0.1f)
+                if (!hasValidSidecar) {
+                    updateNotification("Error", "No saved translation found", 0)
+                    broadcastResult(chapter, success = false, error = "No saved translation found for this chapter. Translate it first.")
+                    stopSelf()
+                    return
+                }
+            } else {
+                if (!hasValidSidecar) {
+                    translations = pipeline.extractText(
+                        chapter = chapter,
+                        chapterDocument = chapterDocument,
+                        sourceLanguage = sourceLanguage,
+                    ) { title, detail, progress ->
+                        updateNotification(title, detail, (progress * 100).toInt())
+                        broadcastProgress(chapter, title, detail, progress)
+                    }
+                    // Save the sidecar immediately to cache the OCR results
+                    storage.writeTranslation(chapter, translations)
+                }
+
+                val needsTranslation = translations!!.values.any { page -> 
+                    page.blocks.any { it.translation.isBlank() } 
+                }
+
+                if (needsTranslation) {
+                    if (translationEngine == TranslationEngine.GEMINI && !isConfirmed) {
+                        // Only lines that will really be sent are counted (skips translated,
+                        // duplicate, watermark and remembered lines).
+                        val (chunks, blocks) = pipeline.estimateGeminiChunks(
+                            pages = translations,
+                            sourceLanguage = sourceLanguage,
+                            targetLanguage = targetLanguage,
+                            geminiModelName = geminiModelName,
+                        )
+                        if (chunks > 0) {
+                            sendBroadcast(Intent(ACTION_REQUIRE_CONFIRMATION).apply {
+                                setPackage(packageName)
+                                putExtra(EXTRA_STORAGE_KEY, chapter.storageKey)
+                                putExtra(EXTRA_CHUNK_COUNT, chunks)
+                                putExtra(EXTRA_BLOCK_COUNT, blocks)
+                            })
+                            return
+                        }
+                    }
+
+                    val mutableTranslations = translations as MutableMap<String, PageTranslation>
+                    pipeline.translateText(
+                        pageTranslations = mutableTranslations,
+                        sourceLanguage = sourceLanguage,
+                        targetLanguage = targetLanguage,
+                        translationEngine = translationEngine,
+                        geminiApiKey = geminiApiKey,
+                        geminiModelName = geminiModelName,
+                        deepLApiKey = deepLApiKey,
+                        // Save after every request so a later failure never loses paid-for work.
+                        onChunkSaved = { storage.writeTranslation(chapter, mutableTranslations) },
+                    ) { title, detail, progress ->
+                        updateNotification(title, detail, (progress * 100).toInt())
+                        broadcastProgress(chapter, title, detail, progress)
+                    }
+                    updateNotification("Saving translation", chapter.chapterDisplayName, 95)
+                    storage.writeTranslation(chapter, translations)
+                }
             }
 
-            updateNotification("Saving translation", chapter.chapterDisplayName, 95)
-            storage.writeTranslation(chapter, translations)
-
-            updateNotification("Rendering chapter", chapter.chapterDisplayName, 97)
-            exporter.exportTranslatedSibling(chapter, translations)
-
-            updateNotification("Exporting to Local Source", chapter.chapterDisplayName, 99)
-            exporter.exportToLocalSource(chapter, translations)
+            updateNotification("Exporting to Local Source", chapter.chapterDisplayName, 97)
+            broadcastProgress(chapter, "Rendering chapter", "Writing pages to the Local Source", 0.97f)
+            exporter.exportToLocalSource(
+                chapter = chapter,
+                translations = translations!!,
+                translatorLabel = if (rerenderOnly) null else translationEngine.label,
+                targetLanguage = if (rerenderOnly) null else targetLanguage,
+            )
 
             updateNotification("Completed ✓", chapter.chapterDisplayName, 100)
             broadcastResult(chapter, success = true)
@@ -202,12 +269,15 @@ class TranslationService : Service() {
 
         const val ACTION_PROGRESS = "app.honyuka.TRANSLATION_PROGRESS"
         const val ACTION_RESULT = "app.honyuka.TRANSLATION_RESULT"
+        const val ACTION_REQUIRE_CONFIRMATION = "app.honyuka.TRANSLATION_REQUIRE_CONFIRMATION"
         const val EXTRA_STORAGE_KEY = "storage_key"
         const val EXTRA_PROGRESS_TITLE = "progress_title"
         const val EXTRA_PROGRESS_DETAIL = "progress_detail"
         const val EXTRA_PROGRESS_VALUE = "progress_value"
         const val EXTRA_RESULT_SUCCESS = "result_success"
         const val EXTRA_RESULT_ERROR = "result_error"
+        const val EXTRA_CHUNK_COUNT = "chunk_count"
+        const val EXTRA_BLOCK_COUNT = "block_count"
 
         private const val EXTRA_SOURCE_NAME = "source_name"
         private const val EXTRA_MANGA_NAME = "manga_name"
@@ -223,6 +293,8 @@ class TranslationService : Service() {
         private const val EXTRA_GEMINI_API_KEY = "gemini_api_key"
         private const val EXTRA_GEMINI_MODEL = "gemini_model"
         private const val EXTRA_DEEPL_API_KEY = "deepl_api_key"
+        private const val EXTRA_RERENDER_ONLY = "rerender_only"
+        private const val EXTRA_CONFIRMED = "confirmed"
 
         fun buildIntent(
             context: Context,
@@ -233,6 +305,7 @@ class TranslationService : Service() {
             geminiApiKey: String,
             geminiModelName: String,
             deepLApiKey: String,
+            confirmed: Boolean = false,
         ): Intent {
             return Intent(context, TranslationService::class.java).apply {
                 putExtra(EXTRA_SOURCE_NAME, chapter.sourceName)
@@ -249,6 +322,24 @@ class TranslationService : Service() {
                 putExtra(EXTRA_GEMINI_API_KEY, geminiApiKey)
                 putExtra(EXTRA_GEMINI_MODEL, geminiModelName)
                 putExtra(EXTRA_DEEPL_API_KEY, deepLApiKey)
+                putExtra(EXTRA_CONFIRMED, confirmed)
+            }
+        }
+
+        fun buildRerenderIntent(
+            context: Context,
+            chapter: ChapterEntry,
+        ): Intent {
+            return Intent(context, TranslationService::class.java).apply {
+                putExtra(EXTRA_SOURCE_NAME, chapter.sourceName)
+                putExtra(EXTRA_MANGA_NAME, chapter.mangaName)
+                putExtra(EXTRA_CHAPTER_DISPLAY, chapter.chapterDisplayName)
+                putExtra(EXTRA_CHAPTER_BASE, chapter.chapterBaseName)
+                putExtra(EXTRA_CHAPTER_URI, chapter.chapterUri.toString())
+                putExtra(EXTRA_THUMBNAIL_URI, chapter.thumbnailUri?.toString())
+                putExtra(EXTRA_IS_CBZ, chapter.isCbz)
+                putExtra(EXTRA_TRANSLATED, chapter.translated)
+                putExtra(EXTRA_RERENDER_ONLY, true)
             }
         }
 
