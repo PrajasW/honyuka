@@ -1,3 +1,6 @@
 <resources>
-    <style name="Theme.Honyuka" parent="Theme.Material3.DayNight.NoActionBar" />
+    <!-- Washi paper background so launch matches the Compose theme (no colour flash). -->
+    <style name="Theme.Honyuka" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="android:windowBackground">@color/honyuka_bg</item>
+    </style>
 </resources>

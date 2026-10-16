@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.documentfile.provider.DocumentFile
@@ -18,6 +19,8 @@ import app.honyuka.data.HonyukaPreferences
 import app.honyuka.data.HonyukaStorage
 import app.honyuka.export.RenderedChapterExporter
 import app.honyuka.model.ChapterEntry
+import app.honyuka.model.LocalBackend
+import app.honyuka.model.LocalModel
 import app.honyuka.model.PageTranslation
 import app.honyuka.model.SourceLanguage
 import app.honyuka.model.TargetLanguage
@@ -60,6 +63,12 @@ class TranslationService : Service() {
         val geminiApiKey = intent.getStringExtra(EXTRA_GEMINI_API_KEY).orEmpty()
         val geminiModelName = intent.getStringExtra(EXTRA_GEMINI_MODEL) ?: ""
         val deepLApiKey = intent.getStringExtra(EXTRA_DEEPL_API_KEY) ?: ""
+        val localModel = intent.getStringExtra(EXTRA_LOCAL_MODEL)
+            ?.let { name -> LocalModel.entries.firstOrNull { it.name == name } }
+            ?: LocalModel.DEFAULT
+        val localBackend = intent.getStringExtra(EXTRA_LOCAL_BACKEND)
+            ?.let { name -> LocalBackend.entries.firstOrNull { it.name == name } }
+            ?: LocalBackend.AUTO
         val rerenderOnly = intent.getBooleanExtra(EXTRA_RERENDER_ONLY, false)
         val isConfirmed = intent.getBooleanExtra(EXTRA_CONFIRMED, false)
 
@@ -70,7 +79,10 @@ class TranslationService : Service() {
 
         translationJob?.cancel()
         translationJob = scope.launch {
-            runTranslation(chapter, sourceLang, targetLang, engine, geminiApiKey, geminiModelName, deepLApiKey, rerenderOnly, isConfirmed)
+            runTranslation(
+                chapter, sourceLang, targetLang, engine, geminiApiKey, geminiModelName, deepLApiKey,
+                localModel, localBackend, rerenderOnly, isConfirmed,
+            )
         }
 
         return START_NOT_STICKY
@@ -84,6 +96,8 @@ class TranslationService : Service() {
         geminiApiKey: String,
         geminiModelName: String,
         deepLApiKey: String,
+        localModel: LocalModel,
+        localBackend: LocalBackend,
         rerenderOnly: Boolean,
         isConfirmed: Boolean,
     ) {
@@ -156,6 +170,15 @@ class TranslationService : Service() {
                     }
 
                     val mutableTranslations = translations as MutableMap<String, PageTranslation>
+                    // On-device inference can take many minutes; keep the CPU awake meanwhile.
+                    val wakeLock = if (translationEngine == TranslationEngine.ON_DEVICE) {
+                        (getSystemService(Context.POWER_SERVICE) as PowerManager)
+                            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Honyuka:OnDeviceTranslation")
+                            .apply { acquire(WAKE_LOCK_TIMEOUT_MS) }
+                    } else {
+                        null
+                    }
+                    try {
                     pipeline.translateText(
                         pageTranslations = mutableTranslations,
                         sourceLanguage = sourceLanguage,
@@ -164,11 +187,16 @@ class TranslationService : Service() {
                         geminiApiKey = geminiApiKey,
                         geminiModelName = geminiModelName,
                         deepLApiKey = deepLApiKey,
+                        localModel = localModel,
+                        localBackend = localBackend,
                         // Save after every request so a later failure never loses paid-for work.
                         onChunkSaved = { storage.writeTranslation(chapter, mutableTranslations) },
                     ) { title, detail, progress ->
                         updateNotification(title, detail, (progress * 100).toInt())
                         broadcastProgress(chapter, title, detail, progress)
+                    }
+                    } finally {
+                        wakeLock?.takeIf { it.isHeld }?.release()
                     }
                     updateNotification("Saving translation", chapter.chapterDisplayName, 95)
                     storage.writeTranslation(chapter, translations)
@@ -293,6 +321,9 @@ class TranslationService : Service() {
         private const val EXTRA_GEMINI_API_KEY = "gemini_api_key"
         private const val EXTRA_GEMINI_MODEL = "gemini_model"
         private const val EXTRA_DEEPL_API_KEY = "deepl_api_key"
+        private const val EXTRA_LOCAL_MODEL = "local_model"
+        private const val EXTRA_LOCAL_BACKEND = "local_backend"
+        private const val WAKE_LOCK_TIMEOUT_MS = 2 * 60 * 60 * 1000L
         private const val EXTRA_RERENDER_ONLY = "rerender_only"
         private const val EXTRA_CONFIRMED = "confirmed"
 
@@ -305,6 +336,8 @@ class TranslationService : Service() {
             geminiApiKey: String,
             geminiModelName: String,
             deepLApiKey: String,
+            localModel: LocalModel = LocalModel.DEFAULT,
+            localBackend: LocalBackend = LocalBackend.AUTO,
             confirmed: Boolean = false,
         ): Intent {
             return Intent(context, TranslationService::class.java).apply {
@@ -322,6 +355,8 @@ class TranslationService : Service() {
                 putExtra(EXTRA_GEMINI_API_KEY, geminiApiKey)
                 putExtra(EXTRA_GEMINI_MODEL, geminiModelName)
                 putExtra(EXTRA_DEEPL_API_KEY, deepLApiKey)
+                putExtra(EXTRA_LOCAL_MODEL, localModel.name)
+                putExtra(EXTRA_LOCAL_BACKEND, localBackend.name)
                 putExtra(EXTRA_CONFIRMED, confirmed)
             }
         }

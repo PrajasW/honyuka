@@ -39,6 +39,7 @@ enum class TranslationEngine(
     val requiresApiKey: Boolean = false,
 ) {
     GEMINI("Gemini", "Best quality for manga dialogue", requiresApiKey = true),
+    ON_DEVICE("On-device", "Free & offline Gemma model on your phone — slower, no quota"),
     DEEPL("DeepL API", "High-quality API translation; requires internet", requiresApiKey = true),
     GOOGLE_TRANSLATE("Google Translate", "Fast web translation"),
     MLKIT("ML Kit Offline", "On-device fallback"),
@@ -83,6 +84,60 @@ enum class GeminiModelPreset(
     }
 }
 
+/**
+ * Downloadable on-device models (LiteRT-LM `.litertlm`, Apache-2.0, no login needed).
+ * [sizeBytes] is the exact file size, used to verify a finished download.
+ */
+enum class LocalModel(
+    val label: String,
+    val repo: String,
+    val fileName: String,
+    val sizeBytes: Long,
+    val description: String,
+) {
+    GEMMA_4_E4B(
+        label = "Gemma 4 E4B",
+        repo = "litert-community/gemma-4-E4B-it-litert-lm",
+        fileName = "gemma-4-E4B-it.litertlm",
+        sizeBytes = 3_659_530_240L,
+        description = "Best quality, closest to Gemini Flash. 3.7 GB, needs ~8 GB RAM.",
+    ),
+    GEMMA_4_E2B(
+        label = "Gemma 4 E2B",
+        repo = "litert-community/gemma-4-E2B-it-litert-lm",
+        fileName = "gemma-4-E2B-it.litertlm",
+        sizeBytes = 2_588_147_712L,
+        description = "Faster and lighter. 2.6 GB, works on 6 GB RAM phones.",
+    ),
+    ;
+
+    val downloadUrl: String get() = "https://huggingface.co/$repo/resolve/main/$fileName?download=true"
+
+    companion object {
+        val DEFAULT = GEMMA_4_E4B
+    }
+}
+
+enum class LocalBackend(val label: String) {
+    AUTO("Auto"),
+    GPU("GPU"),
+    CPU("CPU"),
+}
+
+enum class ThemeMode(val label: String, val jp: String) {
+    AUTO("Auto", "じどう"),
+    WASHI("Washi", "あさ"),
+    YORU("Yoru", "よる"),
+}
+
+/** Download/installed state of one [LocalModel]. */
+data class LocalModelStatus(
+    val downloaded: Boolean = false,
+    val downloading: Boolean = false,
+    val progress: Float = 0f,
+    val error: String? = null,
+)
+
 data class ChapterEntry(
     val sourceName: String,
     val mangaName: String,
@@ -111,6 +166,10 @@ data class HonyukaUiState(
     val geminiModelName: String = GeminiModelPreset.DEFAULT.modelName,
     val availableGeminiModels: List<String> = emptyList(),
     val modelListStatus: String? = null,
+    val localModel: LocalModel = LocalModel.DEFAULT,
+    val localBackend: LocalBackend = LocalBackend.AUTO,
+    val localModelStatus: Map<LocalModel, LocalModelStatus> = emptyMap(),
+    val themeMode: ThemeMode = ThemeMode.AUTO,
     val geminiApiKey: String = "",
     val deepLApiKey: String = "",
     val chapters: List<ChapterEntry> = emptyList(),

@@ -24,7 +24,13 @@ import app.honyuka.model.TargetLanguage
 import app.honyuka.model.TranslationEngine
 import app.honyuka.service.TranslationService
 import app.honyuka.translation.GeminiTestResult
+import app.honyuka.translation.LocalModelManager
 import app.honyuka.translation.fetchGeminiModels
+import app.honyuka.model.LocalBackend
+import app.honyuka.model.LocalModel
+import app.honyuka.model.LocalModelStatus
+import app.honyuka.model.ThemeMode
+import kotlinx.coroutines.delay
 import app.honyuka.translation.testGeminiConnection
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -50,6 +56,9 @@ class HonyukaViewModel(
             translationEngine = preferences.translationEngine(),
             geminiModelName = preferences.geminiModelName(),
             availableGeminiModels = preferences.availableGeminiModels(),
+            localModel = preferences.localModel(),
+            localBackend = preferences.localBackend(),
+            themeMode = preferences.themeMode(),
             geminiApiKey = preferences.geminiApiKey(),
             deepLApiKey = preferences.deepLApiKey(),
         ),
@@ -132,6 +141,66 @@ class HonyukaViewModel(
         ContextCompat.registerReceiver(appContext, resultReceiver, resultFilter, ContextCompat.RECEIVER_NOT_EXPORTED)
         ContextCompat.registerReceiver(appContext, confirmationReceiver, confirmFilter, ContextCompat.RECEIVER_NOT_EXPORTED)
         refresh()
+        refreshLocalModelStatus()
+        // Poll model downloads while any is running (DownloadManager has no push updates).
+        viewModelScope.launch {
+            while (true) {
+                delay(1_000)
+                if (_state.value.localModelStatus.values.any { it.downloading }) refreshLocalModelStatus()
+            }
+        }
+    }
+
+    private fun refreshLocalModelStatus() {
+        viewModelScope.launch {
+            val statuses = withContext(Dispatchers.IO) {
+                LocalModel.entries.associateWith { LocalModelManager.status(appContext, it) }
+            }
+            _state.update { it.copy(localModelStatus = statuses) }
+        }
+    }
+
+    fun onLocalModelSelected(model: LocalModel) {
+        preferences.saveLocalModel(model)
+        _state.update { it.copy(localModel = model) }
+    }
+
+    fun onLocalBackendSelected(backend: LocalBackend) {
+        preferences.saveLocalBackend(backend)
+        _state.update { it.copy(localBackend = backend) }
+    }
+
+    fun onThemeModeSelected(mode: ThemeMode) {
+        preferences.saveThemeMode(mode)
+        _state.update { it.copy(themeMode = mode) }
+    }
+
+    fun downloadLocalModel(model: LocalModel) {
+        onLocalModelSelected(model)
+        viewModelScope.launch {
+            val error = withContext(Dispatchers.IO) { LocalModelManager.startDownload(appContext, model) }
+            if (error != null) {
+                _state.update {
+                    it.copy(localModelStatus = it.localModelStatus + (model to LocalModelStatus(error = error)))
+                }
+            } else {
+                refreshLocalModelStatus()
+            }
+        }
+    }
+
+    fun cancelLocalModelDownload(model: LocalModel) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { LocalModelManager.cancelDownload(appContext, model) }
+            refreshLocalModelStatus()
+        }
+    }
+
+    fun deleteLocalModel(model: LocalModel) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { LocalModelManager.delete(appContext, model) }
+            refreshLocalModelStatus()
+        }
     }
 
     override fun onCleared() {
@@ -284,6 +353,14 @@ class HonyukaViewModel(
             TranslationEngine.DEEPL -> currentState.deepLApiKey
             else -> ""
         }
+        if (translationEngine == TranslationEngine.ON_DEVICE &&
+            !LocalModelManager.isDownloaded(appContext, currentState.localModel)
+        ) {
+            val message = "Download ${currentState.localModel.label} in Settings → On-device model first. 📥"
+            Toast.makeText(appContext, message, Toast.LENGTH_LONG).show()
+            _state.update { it.copy(message = message) }
+            return
+        }
         if (translationEngine.requiresApiKey && selectedApiKey.isBlank()) {
             val message = "Add a ${translationEngine.label} API key in Settings before using this translator."
             Toast.makeText(appContext, message, Toast.LENGTH_LONG).show()
@@ -309,6 +386,8 @@ class HonyukaViewModel(
             geminiApiKey = currentState.geminiApiKey,
             geminiModelName = currentState.geminiModelName,
             deepLApiKey = currentState.deepLApiKey,
+            localModel = currentState.localModel,
+            localBackend = currentState.localBackend,
             confirmed = false,
         )
         ContextCompat.startForegroundService(appContext, intent)
@@ -331,6 +410,8 @@ class HonyukaViewModel(
             geminiApiKey = currentState.geminiApiKey,
             geminiModelName = currentState.geminiModelName,
             deepLApiKey = currentState.deepLApiKey,
+            localModel = currentState.localModel,
+            localBackend = currentState.localBackend,
             confirmed = true,
         )
         ContextCompat.startForegroundService(appContext, intent)

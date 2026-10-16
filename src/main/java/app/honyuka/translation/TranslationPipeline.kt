@@ -7,11 +7,21 @@ import android.graphics.ImageDecoder
 import android.os.Build
 import androidx.documentfile.provider.DocumentFile
 import app.honyuka.model.ChapterEntry
+import app.honyuka.model.LocalBackend
+import app.honyuka.model.LocalModel
 import app.honyuka.model.PageTranslation
 import app.honyuka.model.SourceLanguage
 import app.honyuka.model.TargetLanguage
 import app.honyuka.model.TranslationBlock
 import app.honyuka.model.TranslationEngine
+import com.google.ai.edge.litertlm.Backend
+import com.google.ai.edge.litertlm.Content
+import com.google.ai.edge.litertlm.Contents
+import com.google.ai.edge.litertlm.ConversationConfig
+import com.google.ai.edge.litertlm.Engine
+import com.google.ai.edge.litertlm.EngineConfig
+import com.google.ai.edge.litertlm.SamplerConfig
+import com.google.ai.edge.litertlm.ThinkingConfig
 import com.google.android.gms.tasks.Tasks
 import com.google.mlkit.common.model.DownloadConditions
 import com.google.mlkit.nl.translate.TranslateLanguage
@@ -95,6 +105,8 @@ class TranslationPipeline(
         geminiApiKey: String,
         geminiModelName: String,
         deepLApiKey: String,
+        localModel: LocalModel = LocalModel.DEFAULT,
+        localBackend: LocalBackend = LocalBackend.AUTO,
         onChunkSaved: () -> Unit = {},
         onProgress: (title: String, detail: String, progress: Float) -> Unit,
     ) {
@@ -107,11 +119,17 @@ class TranslationPipeline(
             geminiApiKey = geminiApiKey,
             geminiModelName = geminiModelName,
             deepLApiKey = deepLApiKey,
+            localModel = localModel,
+            localBackend = localBackend,
             onChunkDone = { done, total ->
                 onChunkSaved()
                 onProgress(
                     "Translating text",
-                    "Gemini request $done of $total done",
+                    if (translationEngine == TranslationEngine.ON_DEVICE) {
+                        "On-device: chunk $done of $total"
+                    } else {
+                        "Gemini request $done of $total done"
+                    },
                     0.65f + 0.3f * done / total.coerceAtLeast(1),
                 )
             },
@@ -390,6 +408,8 @@ private fun createTranslationEngine(
     geminiApiKey: String,
     geminiModelName: String,
     deepLApiKey: String,
+    localModel: LocalModel,
+    localBackend: LocalBackend,
     onChunkDone: (done: Int, total: Int) -> Unit,
 ): TextTranslationEngine {
     return when (engine) {
@@ -405,6 +425,14 @@ private fun createTranslationEngine(
             sourceLanguage = sourceLanguage,
             targetLanguage = targetLanguage,
             apiKey = deepLApiKey,
+        )
+        TranslationEngine.ON_DEVICE -> LocalLlmTranslationEngine(
+            context = context,
+            sourceLanguage = sourceLanguage,
+            targetLanguage = targetLanguage,
+            model = localModel,
+            backendPreference = localBackend,
+            onChunkDone = onChunkDone,
         )
         TranslationEngine.GOOGLE_TRANSLATE -> GoogleTranslateWebEngine(sourceLanguage, targetLanguage)
         TranslationEngine.MLKIT -> MlKitTranslationEngine(sourceLanguage, targetLanguage)
@@ -601,56 +629,77 @@ private class DeepLTranslationEngine(
 }
 
 /**
- * Gemini translation engine tuned to spend as little API quota as possible.
+ * Shared batching for LLM translators (Gemini API and on-device Gemma).
  *
- * Only text is sent (OCR runs on-device). Per run:
+ * Per run:
  * - blocks that already have a translation are skipped, so a retry only sends what is left
  * - watermark/URL blocks are never sent
  * - identical lines are sent once and the result is fanned out to every block
  * - lines seen before (any chapter) come from [GeminiTranslationMemory] for free
- * - a typical chapter fits in one request; progress is reported after every request
+ * - lines are packed into chunks of [tokenBudget]; progress is reported after every chunk
  *   so the caller can save it, and a failure keeps everything translated so far
- * - thinking is turned down to the minimum the model allows (thinking tokens are billed)
  */
-private class GeminiTranslationEngine(
+private abstract class LlmBatchTranslationEngine(
     cacheDir: File,
-    private val sourceLanguage: SourceLanguage,
-    private val targetLanguage: TargetLanguage,
-    private val apiKey: String,
-    private val modelName: String,
-    private val onChunkDone: (done: Int, total: Int) -> Unit = { _, _ -> },
+    protected val sourceLanguage: SourceLanguage,
+    protected val targetLanguage: TargetLanguage,
+    private val onChunkDone: (done: Int, total: Int) -> Unit,
 ) : TextTranslationEngine {
 
     /** One unique line of dialogue and every block that shows it. */
-    private data class DialogueEntry(
+    protected data class DialogueEntry(
         val globalId: Int,
         val pageName: String,
         val text: String,
         val targets: List<TranslationBlock>,
     )
 
+    /** Shown in error messages, e.g. "Gemini" or "On-device model". */
+    protected abstract val engineName: String
+
+    /** Identifies the model in translation-memory keys. */
+    protected abstract val memoryModelKey: String
+
+    /** Estimated input tokens per request. */
+    protected abstract val tokenBudget: Int
+
+    /** How many times a malformed chunk may be halved before its lines are skipped. */
+    protected abstract val maxSplitDepth: Int
+
+    /** Pause between requests (ms); 0 for on-device. */
+    protected abstract val interRequestDelayMs: Long
+
+    /** Sends one prompt and returns the raw model output. */
+    protected abstract fun complete(systemPrompt: String, userText: String): String
+
+    /**
+     * Errors that must stop the run instead of splitting the chunk (quota,
+     * network, model failed to load…). Malformed output is never fatal.
+     */
+    protected abstract fun isFatal(error: Exception): Boolean
+
     init {
         GeminiTranslationMemory.attach(cacheDir)
     }
 
-    /** Returns (request count, blocks to be translated) without calling the API. */
+    /** Returns (request count, blocks to be translated) without calling the model. */
     fun plan(pages: Map<String, PageTranslation>): Pair<Int, Int> {
         val pending = collectPending(pages, applyMemoryHits = false)
         return packChunks(pending).size to pending.sumOf { it.targets.size }
     }
 
-    override fun translate(pages: MutableMap<String, PageTranslation>) {
-        require(apiKey.isNotBlank()) { "Gemini API key is required for the Gemini translator." }
-        require(modelName.isNotBlank()) { "Gemini model name is required." }
+    /** Called once before the first request (e.g. to load a local model). */
+    protected open fun prepare() = Unit
 
+    override fun translate(pages: MutableMap<String, PageTranslation>) {
         val pending = collectPending(pages, applyMemoryHits = true)
         val chunks = packChunks(pending)
+        if (chunks.isNotEmpty()) prepare()
 
         var failure: Exception? = null
         var translatedEntries = 0
         for ((chunkIndex, chunk) in chunks.withIndex()) {
-            // Pace consecutive requests to stay under per-minute limits.
-            if (chunkIndex > 0) Thread.sleep(INTER_REQUEST_DELAY_MS)
+            if (chunkIndex > 0 && interRequestDelayMs > 0) Thread.sleep(interRequestDelayMs)
             val resultMap = try {
                 translateChunk(chunk, depth = 0)
             } catch (e: Exception) {
@@ -675,7 +724,7 @@ private class GeminiTranslationEngine(
         failure?.let { error ->
             if (translatedEntries == 0) throw error
             throw IllegalStateException(
-                "Gemini stopped after translating $translatedEntries of ${pending.size} lines: ${error.message} " +
+                "$engineName stopped after translating $translatedEntries of ${pending.size} lines: ${error.message} " +
                     "Progress was saved — translate again later and only the remaining lines will be sent.",
                 error,
             )
@@ -685,13 +734,13 @@ private class GeminiTranslationEngine(
             val missing = pending.size - translatedEntries
             if (translatedEntries == 0) {
                 error(
-                    "Gemini translation failed — none of the ${pending.size} lines could be translated. " +
-                        "Check your Gemini API key and model (\"$modelName\") in Settings."
+                    "$engineName translation failed — none of the ${pending.size} lines could be translated. " +
+                        "Check the translator settings and try again."
                 )
             }
             if (pending.size > 2 && missing > pending.size / 2) {
                 error(
-                    "Gemini translation mostly failed — only $translatedEntries of ${pending.size} lines were translated. " +
+                    "$engineName translation mostly failed — only $translatedEntries of ${pending.size} lines were translated. " +
                         "Progress was saved; translate again to retry the rest."
                 )
             }
@@ -706,7 +755,7 @@ private class GeminiTranslationEngine(
     }
 
     /**
-     * Collects the lines that actually need an API call: untranslated, not a
+     * Collects the lines that actually need the model: untranslated, not a
      * watermark, de-duplicated, and not already in the translation memory.
      * Memory hits are written straight onto the blocks when [applyMemoryHits].
      */
@@ -735,39 +784,40 @@ private class GeminiTranslationEngine(
         }
     }
 
-    // ── Chunk Packer ────────────────────────────────────────────────────────
-
     /**
-     * Groups [entries] into translation chunks, each targeting ≤ [TOKEN_BUDGET]
-     * estimated input tokens.  Boundaries always fall between pages so that
-     * same-page dialogue is never split.
+     * Groups [entries] into chunks of ≤ [tokenBudget] estimated input tokens.
+     * Boundaries fall between pages when possible so same-page dialogue stays
+     * together; a single page bigger than the budget is split by line.
      */
     private fun packChunks(entries: List<DialogueEntry>): List<List<DialogueEntry>> {
         if (entries.isEmpty()) return emptyList()
-
-        val pageGroups = entries.groupBy { it.pageName }.values
 
         val chunks = mutableListOf<List<DialogueEntry>>()
         var currentChunk = mutableListOf<DialogueEntry>()
         var currentTokens = 0
 
-        for (pageEntries in pageGroups) {
+        fun flush() {
+            if (currentChunk.isNotEmpty()) chunks += currentChunk.toList()
+            currentChunk = mutableListOf()
+            currentTokens = 0
+        }
+
+        for (pageEntries in entries.groupBy { it.pageName }.values) {
             val pageTokens = pageEntries.sumOf { estimateTokens(it.text) }
-
-            // If adding this page would exceed the budget, flush the current chunk
-            // (unless it's empty — a single huge page still goes through)
-            if (currentChunk.isNotEmpty() && currentTokens + pageTokens > TOKEN_BUDGET) {
-                chunks += currentChunk.toList()
-                currentChunk = mutableListOf()
-                currentTokens = 0
+            if (currentChunk.isNotEmpty() && currentTokens + pageTokens > tokenBudget) flush()
+            if (pageTokens <= tokenBudget) {
+                currentChunk += pageEntries
+                currentTokens += pageTokens
+            } else {
+                for (entry in pageEntries) {
+                    val tokens = estimateTokens(entry.text)
+                    if (currentChunk.isNotEmpty() && currentTokens + tokens > tokenBudget) flush()
+                    currentChunk += entry
+                    currentTokens += tokens
+                }
             }
-
-            currentChunk += pageEntries
-            currentTokens += pageTokens
         }
-        if (currentChunk.isNotEmpty()) {
-            chunks += currentChunk.toList()
-        }
+        flush()
         return chunks
     }
 
@@ -784,27 +834,22 @@ private class GeminiTranslationEngine(
         return (tokens * 10 + 14) / 15  // ≈ ×0.67 adjustment to approximate real tokeniser
     }
 
-    // ── Compact Wire Format & API Call ──────────────────────────────────────
-
     /**
      * Translates one chunk. On a malformed or truncated response the chunk is
-     * split in half, at most [MAX_SPLIT_DEPTH] times; past that the lines are
-     * left untranslated for the next run rather than spending more requests.
-     * API and network errors are not split — they were already retried and
-     * splitting would only burn more quota.
+     * split in half, at most [maxSplitDepth] times; past that the lines are
+     * left untranslated for the next run.
      */
     private fun translateChunk(chunk: List<DialogueEntry>, depth: Int): Map<Int, String> {
         return try {
-            val raw = callGemini(buildCompactInput(chunk))
-            parseCompactOutput(raw, chunk)
+            parseCompactTranslations(complete(systemPrompt(), buildCompactInput(chunk)), chunk.map { it.globalId }.toSet())
         } catch (e: Exception) {
-            if (e is GeminiApiException || e is HttpException || e is IOException) throw e
-            if (depth >= MAX_SPLIT_DEPTH || chunk.size < 2) return emptyMap()
+            if (isFatal(e)) throw e
+            if (depth >= maxSplitDepth || chunk.size < 2) return emptyMap()
 
             val mid = chunk.size / 2
-            Thread.sleep(INTER_REQUEST_DELAY_MS)
+            if (interRequestDelayMs > 0) Thread.sleep(interRequestDelayMs)
             val firstHalf = translateChunk(chunk.subList(0, mid), depth + 1)
-            Thread.sleep(INTER_REQUEST_DELAY_MS)
+            if (interRequestDelayMs > 0) Thread.sleep(interRequestDelayMs)
             firstHalf + translateChunk(chunk.subList(mid, chunk.size), depth + 1)
         }
     }
@@ -817,37 +862,135 @@ private class GeminiTranslationEngine(
             sb.append('[')
             sb.append(entry.globalId)
             sb.append(',')
-            sb.append(jsonEscape(entry.text))
+            sb.append(JSONObject.quote(entry.text))
             sb.append(']')
         }
         sb.append(']')
         return sb.toString()
     }
 
-    private fun jsonEscape(text: String): String {
-        val sb = StringBuilder(text.length + 2)
-        sb.append('"')
-        for (ch in text) {
-            when (ch) {
-                '"' -> sb.append("\\\"")
-                '\\' -> sb.append("\\\\")
-                '\n' -> sb.append("\\n")
-                '\r' -> sb.append("\\r")
-                '\t' -> sb.append("\\t")
-                else -> sb.append(ch)
-            }
+    private fun normaliseForCache(text: String): String {
+        return text.trim()
+            .replace(WHITESPACE_REGEX, " ")
+            .lowercase(Locale.ROOT)
+    }
+
+    private fun memoryKey(text: String): String {
+        return "$memoryModelKey|${sourceLanguage.languageTag}>${targetLanguage.languageTag}|${normaliseForCache(text)}"
+    }
+
+    protected open fun systemPrompt(): String = translationSystemPrompt(sourceLanguage, targetLanguage)
+
+    override fun close() = Unit
+
+    private companion object {
+        /** Per-entry framing overhead: `[id,""]` ≈ 8 tokens */
+        const val ENTRY_OVERHEAD_TOKENS = 8
+        val WHITESPACE_REGEX = Regex("\\s+")
+    }
+}
+
+private fun translationSystemPrompt(source: SourceLanguage, target: TargetLanguage): String {
+    return "You are a manga translator. Translate ${source.label} dialogue to concise natural ${target.label}.\n" +
+        "Input/output format: [[id,\"text\"],...]\n" +
+        "Example:\n" +
+        "Input: [[0,\"おい待て\"],[1,\"逃げろ！\"]]\n" +
+        "Output: [[\"0\",\"Hey, wait!\"],[\"1\",\"Run!\"]]\n" +
+        "Rules: Preserve IDs. Translate ALL text to ${target.label}. Keep it short for speech bubbles. " +
+        "Preserve names and honorifics. Watermarks/URLs → RTMTH. Return JSON array only."
+}
+
+/** Parses `[[id,"text"],…]` model output (ids may be numbers or strings). */
+private fun parseCompactTranslations(raw: String, expectedIds: Set<Int>): Map<Int, String> {
+    val array = repairAndParseArray(sanitiseJson(raw))
+    val result = HashMap<Int, String>(expectedIds.size)
+    for (i in 0 until array.length()) {
+        val entry = array.optJSONArray(i) ?: continue
+        if (entry.length() < 2) continue
+        val id = entry.optInt(0, -1)
+        val translation = entry.optString(1, "").trim()
+        if (id in expectedIds && translation.isNotBlank()) {
+            result[id] = translation
         }
-        sb.append('"')
-        return sb.toString()
+    }
+    return result
+}
+
+/** Strips markdown fences, trailing commas and zero-width chars from LLM JSON. */
+private fun sanitiseJson(raw: String): String {
+    var s = raw.trim()
+    if (s.startsWith("```")) {
+        s = s.removePrefix("```json").removePrefix("```")
+    }
+    if (s.endsWith("```")) {
+        s = s.removeSuffix("```")
+    }
+    s = s.trim()
+    s = s.replace(Regex(",\\s*]"), "]")
+    s = s.replace(Regex(",\\s*}"), "}")
+    s = s.replace("﻿", "").replace("​", "")
+    return s
+}
+
+private fun repairAndParseArray(text: String): JSONArray {
+    runCatching { return JSONArray(text) }
+
+    val start = text.indexOf('[')
+    val end = text.lastIndexOf(']')
+    if (start >= 0 && end > start) {
+        runCatching { return JSONArray(text.substring(start, end + 1)) }
+    }
+
+    // If the LLM returned an object with a single key wrapping the array
+    runCatching {
+        val obj = JSONObject(text)
+        val key = obj.keys().asSequence().firstOrNull()
+        if (key != null) {
+            val inner = obj.optJSONArray(key)
+            if (inner != null) return inner
+        }
+    }
+
+    error("JSON repair failed: could not parse model response as [[id,\"text\"]] array.")
+}
+
+/**
+ * Gemini API translator, tuned to spend as little quota as possible: one
+ * request per ~20k input tokens (most chapters take one), minimal thinking,
+ * a response schema, and RetryInfo-aware retries.
+ */
+private class GeminiTranslationEngine(
+    cacheDir: File,
+    sourceLanguage: SourceLanguage,
+    targetLanguage: TargetLanguage,
+    private val apiKey: String,
+    private val modelName: String,
+    onChunkDone: (done: Int, total: Int) -> Unit = { _, _ -> },
+) : LlmBatchTranslationEngine(cacheDir, sourceLanguage, targetLanguage, onChunkDone) {
+
+    override val engineName = "Gemini"
+    override val memoryModelKey = modelName.trim()
+    override val tokenBudget = 20_000
+    override val maxSplitDepth = 2
+    override val interRequestDelayMs = 1_500L
+
+    override fun translate(pages: MutableMap<String, PageTranslation>) {
+        require(apiKey.isNotBlank()) { "Gemini API key is required for the Gemini translator." }
+        require(modelName.isNotBlank()) { "Gemini model name is required." }
+        super.translate(pages)
+    }
+
+    // API and network errors were already retried; splitting would only burn more quota.
+    override fun isFatal(error: Exception): Boolean {
+        return error is GeminiApiException || error is HttpException || error is IOException
     }
 
     /**
-     * Calls the Gemini API and returns the raw response text.
      * - 429/503: waits as long as the server asks (RetryInfo), else exponential backoff
      * - network errors: retried once
      * - a 400 about thinking settings: retried with the next weaker thinking config
      */
-    private fun callGemini(compactInput: String): String {
+    override fun complete(systemPrompt: String, userText: String): String {
         val url = "https://generativelanguage.googleapis.com/v1beta/models/${modelName.trim()}:generateContent"
         val headers = mapOf("x-goog-api-key" to apiKey.trim())
 
@@ -858,7 +1001,7 @@ private class GeminiTranslationEngine(
             try {
                 val response = httpPostJson(
                     url = url,
-                    body = buildGeminiPayload(systemPrompt(), compactInput, modelName, thinking).toString(),
+                    body = buildGeminiPayload(systemPrompt, userText, modelName, thinking).toString(),
                     headers = headers,
                 )
 
@@ -900,101 +1043,7 @@ private class GeminiTranslationEngine(
         }
     }
 
-    // ── JSON Stability Layer ────────────────────────────────────────────────
-
-    private fun parseCompactOutput(raw: String, chunk: List<DialogueEntry>): Map<Int, String> {
-        val array = repairAndParseArray(sanitiseJson(raw))
-
-        val result = HashMap<Int, String>(chunk.size)
-        val expectedIds = chunk.map { it.globalId }.toSet()
-
-        for (i in 0 until array.length()) {
-            val entry = array.optJSONArray(i) ?: continue
-            if (entry.length() < 2) continue
-            // The response schema returns ids as strings; optInt parses both.
-            val id = entry.optInt(0, -1)
-            val translation = entry.optString(1, "").trim()
-            if (id in expectedIds && translation.isNotBlank()) {
-                result[id] = translation
-            }
-        }
-
-        return result
-    }
-
-    private fun sanitiseJson(raw: String): String {
-        var s = raw.trim()
-        if (s.startsWith("```")) {
-            s = s.removePrefix("```json").removePrefix("```")
-        }
-        if (s.endsWith("```")) {
-            s = s.removeSuffix("```")
-        }
-        s = s.trim()
-        s = s.replace(Regex(",\\s*]"), "]")
-        s = s.replace(Regex(",\\s*}"), "}")
-        s = s.replace("﻿", "").replace("​", "")
-        return s
-    }
-
-    private fun repairAndParseArray(text: String): JSONArray {
-        runCatching { return JSONArray(text) }
-
-        val start = text.indexOf('[')
-        val end = text.lastIndexOf(']')
-        if (start >= 0 && end > start) {
-            runCatching { return JSONArray(text.substring(start, end + 1)) }
-        }
-
-        // If the LLM returned an object with a single key wrapping the array
-        runCatching {
-            val obj = JSONObject(text)
-            val key = obj.keys().asSequence().firstOrNull()
-            if (key != null) {
-                val inner = obj.optJSONArray(key)
-                if (inner != null) return inner
-            }
-        }
-
-        error("JSON repair failed: could not parse Gemini response as [[id,\"text\"]] array.")
-    }
-
-    // ── Cache Helpers ───────────────────────────────────────────────────────
-
-    private fun normaliseForCache(text: String): String {
-        return text.trim()
-            .replace(WHITESPACE_REGEX, " ")
-            .lowercase(Locale.ROOT)
-    }
-
-    private fun memoryKey(text: String): String {
-        return "${modelName.trim()}|${sourceLanguage.languageTag}>${targetLanguage.languageTag}|${normaliseForCache(text)}"
-    }
-
-    // ── Prompt ──────────────────────────────────────────────────────────────
-
-    private fun systemPrompt(): String {
-        return "You are a manga translator. Translate ${sourceLanguage.label} dialogue to concise natural ${targetLanguage.label}.\n" +
-            "Input/output format: [[id,\"text\"],...]\n" +
-            "Example:\n" +
-            "Input: [[0,\"おい待て\"],[1,\"逃げろ！\"]]\n" +
-            "Output: [[\"0\",\"Hey, wait!\"],[\"1\",\"Run!\"]]\n" +
-            "Rules: Preserve IDs. Translate ALL text to ${targetLanguage.label}. Keep it short for speech bubbles. " +
-            "Preserve names and honorifics. Watermarks/URLs → RTMTH. Return JSON array only."
-    }
-
-    override fun close() = Unit
-
     private companion object {
-        /**
-         * Target input token budget per request. Most chapters fit in one request;
-         * current Flash/Flash-Lite models allow far more output than this needs.
-         */
-        const val TOKEN_BUDGET = 20_000
-
-        /** Per-entry framing overhead: `[id,""]` ≈ 8 tokens */
-        const val ENTRY_OVERHEAD_TOKENS = 8
-
         /** Maximum attempts for a single Gemini API call on 429/503 errors. */
         const val MAX_API_RETRIES = 5
 
@@ -1004,14 +1053,104 @@ private class GeminiTranslationEngine(
         /** Upper bound on a single wait before retrying. */
         const val MAX_RETRY_WAIT_MS = 60_000L
 
-        /** How many times a malformed chunk may be halved before giving up on it. */
-        const val MAX_SPLIT_DEPTH = 2
-
-        /** Delay between consecutive requests (ms). */
-        const val INTER_REQUEST_DELAY_MS = 1_500L
-
         val RETRYABLE_STATUS_CODES = setOf(429, 503)
-        val WHITESPACE_REGEX = Regex("\\s+")
+    }
+}
+
+/** The on-device model failed to load or run; splitting the chunk won't help. */
+private class LocalModelException(message: String, cause: Throwable? = null) : Exception(message, cause)
+
+/**
+ * Translates with a downloaded Gemma model through LiteRT-LM — free, offline
+ * and private, but much slower than the API. Chunks are small because the
+ * on-device context window is small; each chunk gets a fresh conversation.
+ */
+private class LocalLlmTranslationEngine(
+    private val context: Context,
+    sourceLanguage: SourceLanguage,
+    targetLanguage: TargetLanguage,
+    private val model: LocalModel,
+    private val backendPreference: LocalBackend,
+    onChunkDone: (done: Int, total: Int) -> Unit,
+) : LlmBatchTranslationEngine(context.cacheDir, sourceLanguage, targetLanguage, onChunkDone) {
+
+    override val engineName = "On-device model"
+    override val memoryModelKey = "local:${model.fileName}"
+    override val tokenBudget = 900
+    override val maxSplitDepth = 3
+    override val interRequestDelayMs = 0L
+
+    private var engine: Engine? = null
+
+    override fun prepare() {
+        val file = LocalModelManager.modelFile(context, model)
+        if (!LocalModelManager.isDownloaded(context, model)) {
+            throw LocalModelException("${model.label} isn't downloaded yet. Download it in Settings → On-device model first.")
+        }
+        val backends = when (backendPreference) {
+            LocalBackend.AUTO -> listOf(Backend.GPU(), Backend.CPU())
+            LocalBackend.GPU -> listOf(Backend.GPU())
+            LocalBackend.CPU -> listOf(Backend.CPU())
+        }
+        var lastError: Throwable? = null
+        for (backend in backends) {
+            val candidate = Engine(
+                EngineConfig(
+                    modelPath = file.absolutePath,
+                    backend = backend,
+                    maxNumTokens = MAX_CONTEXT_TOKENS,
+                    cacheDir = context.cacheDir.absolutePath,
+                ),
+            )
+            try {
+                candidate.initialize()
+                engine = candidate
+                return
+            } catch (t: Throwable) {
+                lastError = t
+                runCatching { candidate.close() }
+            }
+        }
+        throw LocalModelException(
+            "Couldn't load ${model.label} on this phone (${lastError?.message}). " +
+                "Try the CPU backend or the smaller model in Settings.",
+            lastError,
+        )
+    }
+
+    override fun isFatal(error: Exception): Boolean = error is LocalModelException
+
+    override fun complete(systemPrompt: String, userText: String): String {
+        val activeEngine = engine ?: throw LocalModelException("On-device model is not loaded.")
+        val conversation = try {
+            activeEngine.createConversation(
+                ConversationConfig(
+                    systemInstruction = Contents.of(systemPrompt),
+                    samplerConfig = SamplerConfig(topK = 40, topP = 0.95, temperature = 0.3, seed = 0),
+                    maxOutputToken = MAX_OUTPUT_TOKENS,
+                    thinkingConfig = ThinkingConfig(enableThinking = false),
+                ),
+            )
+        } catch (t: Throwable) {
+            throw LocalModelException("On-device model stopped responding: ${t.message}", t)
+        }
+        return conversation.use {
+            val reply = it.sendMessage(userText)
+            reply.contents.contents
+                .filterIsInstance<Content.Text>()
+                .joinToString("") { part -> part.text }
+        }
+    }
+
+    override fun close() {
+        runCatching { engine?.close() }
+        engine = null
+    }
+
+    private companion object {
+        /** Prompt + output must fit; Gemma 4 E2B/E4B allow much more, but memory is tight. */
+        const val MAX_CONTEXT_TOKENS = 4_096
+        const val MAX_OUTPUT_TOKENS = 2_048
     }
 }
 

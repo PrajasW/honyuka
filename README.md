@@ -30,8 +30,10 @@ Honyuka offers several configuration options to customize your translation exper
   - **Gemini:** Cloud-based translation using Google's Gemini models for highly contextual and accurate translations. Requires an API Key.
   - **ML Kit:** On-device, offline translation provided by Google. Fast and private, but may have lower contextual quality.
   - **DeepL:** High-quality neural machine translation. Requires an API Key.
+  - **On-device (Gemma):** Free, offline and private. Download **Gemma 4 E4B** (3.7 GB, closest to Gemini Flash; ~8 GB RAM phones) or **Gemma 4 E2B** (2.6 GB, faster; 6 GB RAM) in Settings → On-device model. Runs through Google's LiteRT-LM on GPU (falls back to CPU). Expect a few minutes per chapter; no API quota.
 - **Gemini Model:** Defaults to `gemini-flash-lite-latest` (cheapest, largest free quota). Tap **Refresh models** to list every model your key can use, or type any model name.
 - **API Keys:** Secure fields to enter your respective Gemini and DeepL API keys.
+- **Theme:** Auto, ☀️ Washi (light) or 🌙 Yoru (dark).
 
 This folder is now its own Android project. You can open `honyuka/` directly in Android Studio or build it from inside this folder without using the parent repo's Gradle setup.
 

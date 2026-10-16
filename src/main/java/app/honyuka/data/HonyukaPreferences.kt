@@ -3,6 +3,9 @@ package app.honyuka.data
 import android.content.Context
 import android.net.Uri
 import app.honyuka.model.GeminiModelPreset
+import app.honyuka.model.LocalBackend
+import app.honyuka.model.LocalModel
+import app.honyuka.model.ThemeMode
 import app.honyuka.model.SourceLanguage
 import app.honyuka.model.TargetLanguage
 import app.honyuka.model.TranslationEngine
@@ -85,6 +88,36 @@ class HonyukaPreferences(context: Context) {
         prefs.edit().putString(KEY_DEEPL_API_KEY, apiKey.trim()).apply()
     }
 
+    fun localModel(): LocalModel = enumPref(KEY_LOCAL_MODEL, LocalModel.DEFAULT)
+
+    fun saveLocalModel(model: LocalModel) {
+        prefs.edit().putString(KEY_LOCAL_MODEL, model.name).apply()
+    }
+
+    fun localBackend(): LocalBackend = enumPref(KEY_LOCAL_BACKEND, LocalBackend.AUTO)
+
+    fun saveLocalBackend(backend: LocalBackend) {
+        prefs.edit().putString(KEY_LOCAL_BACKEND, backend.name).apply()
+    }
+
+    fun themeMode(): ThemeMode = enumPref(KEY_THEME_MODE, ThemeMode.AUTO)
+
+    fun saveThemeMode(mode: ThemeMode) {
+        prefs.edit().putString(KEY_THEME_MODE, mode.name).apply()
+    }
+
+    /** DownloadManager id of an in-progress model download, or -1. */
+    fun localModelDownloadId(model: LocalModel): Long = prefs.getLong(KEY_DOWNLOAD_ID_PREFIX + model.name, -1L)
+
+    fun saveLocalModelDownloadId(model: LocalModel, id: Long) {
+        prefs.edit().putLong(KEY_DOWNLOAD_ID_PREFIX + model.name, id).apply()
+    }
+
+    private inline fun <reified T : Enum<T>> enumPref(key: String, default: T): T {
+        val saved = prefs.getString(key, null) ?: return default
+        return enumValues<T>().firstOrNull { it.name == saved } ?: default
+    }
+
     private companion object {
         const val KEY_ROOT_URI = "root_uri"
         const val KEY_SOURCE_LANGUAGE = "source_language"
@@ -94,6 +127,10 @@ class HonyukaPreferences(context: Context) {
         const val KEY_GEMINI_API_KEY = "gemini_api_key"
         const val KEY_GEMINI_MODEL_LIST = "gemini_model_list"
         const val KEY_MODEL_PRESETS_MIGRATED = "model_presets_migrated_v2"
+        const val KEY_LOCAL_MODEL = "local_model"
+        const val KEY_LOCAL_BACKEND = "local_backend"
+        const val KEY_THEME_MODE = "theme_mode"
+        const val KEY_DOWNLOAD_ID_PREFIX = "local_model_download_"
         const val KEY_DEEPL_API_KEY = "deepl_api_key"
     }
 }
