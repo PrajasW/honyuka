@@ -1,8 +1,16 @@
+<p align="center">
+  <img src="docs/icon.png" width="140" alt="Honyuka app icon">
+</p>
+
 # Honyuka v0.2.0
 
 Honyuka (ほにゅか, a playful mispronunciation of *honyakuya*, "translator") is an Android app that translates the manga chapters you've downloaded in [Mihon](https://mihon.app/) and puts the translated chapter back into Mihon's **Local source**, ready to read.
 
 It reads the text on each page on-device, translates it with the engine you choose — including a **free, offline Gemma model that runs on your phone** — and redraws the translation into the speech bubbles.
+
+<img src="docs/mascot.png" width="96" align="right" alt="Fuki-chan">
+
+**Meet Fuki-chan** (吹き出し, "speech bubble"), Honyuka's mascot: a speech bubble that turns Japanese bubbles into your language. The app icon shows a あ bubble becoming Fuki-chan.
 
 ## Screenshots
 

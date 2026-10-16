@@ -22,7 +22,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
@@ -41,18 +40,22 @@ import kotlinx.coroutines.delay
 
 enum class Mood { HAPPY, YUM, DIZZY, SLEEPY, WINK }
 
-private const val INK = 0xFF3A3335
-private val Ink = Color(INK)
-private val Nori = Color(0xFF2F3B35)
-private val NoriShine = Color(0xFF4A5A50)
+private val Ink = Color(0xFF3A3335)
 
+/** Speech-bubble body with its tail bottom-left (same path as the app icon). */
 private val BodyPath: Path = svgPath(
-    "M50 8 C56 8 60 12 64 18 L90 70 C95 80 90 92 78 92 L22 92 C10 92 5 80 10 70 L36 18 C40 12 44 8 50 8 Z",
+    "M50 12 C76 12 92 27 92 45 C92 63 76 77 52 77 C47 77 43 76.5 39 75.5 L22 90 " +
+        "C21.2 90.7 20 90 20.4 89 L26 72.5 C15 67 8 57 8 45 C8 27 24 12 50 12 Z",
 )
+private val ShinePath: Path = svgPath("M24 34 Q30 22 44 19")
+private val BadgeLetterPath: Path = svgPath("M80.8 24.5 L85 15 L89.2 24.5 M82.5 21.2 L87.5 21.2")
 
 private fun svgPath(d: String): Path = PathParser().parsePathString(d).toPath()
 
-/** Onigiri-kun, ported from the kawaii-minimalist skill (viewBox 0 0 100 100). */
+/**
+ * Fuki-chan (吹き出し, "speech bubble"): Honyuka's mascot, a speech bubble with a
+ * small "A" badge for the translated side. Drawn in a 100×100 box like the app icon.
+ */
 @Composable
 fun Mascot(
     modifier: Modifier = Modifier,
@@ -77,14 +80,21 @@ fun Mascot(
         val unit = this.size.minDimension / 100f
         translate(top = offset * this.size.height) {
             scale(unit, unit, pivot = Offset.Zero) {
-                drawOval(c.shadow, topLeft = Offset(20f, 92.5f - offset * 100f), size = Size(60f, 7f))
+                drawOval(c.shadow, topLeft = Offset(22f, 92.6f - offset * 100f), size = Size(60f, 6.8f))
                 drawPath(BodyPath, c.rice)
-                drawPath(BodyPath, Ink, style = Stroke(width = 2.5f, join = StrokeJoin.Round))
-                drawRoundRect(Nori, topLeft = Offset(35f, 66f), size = Size(30f, 26f), cornerRadius = CornerRadius(3f))
-                drawRoundRect(NoriShine, topLeft = Offset(35f, 66f), size = Size(30f, 3f), cornerRadius = CornerRadius(1.5f))
-                drawOval(c.sakura.copy(alpha = 0.55f), topLeft = Offset(27f, 54f), size = Size(10f, 6f))
-                drawOval(c.sakura.copy(alpha = 0.55f), topLeft = Offset(63f, 54f), size = Size(10f, 6f))
-                drawFace(mood, c.sakura)
+                drawPath(BodyPath, Ink, style = Stroke(width = 2.8f, join = StrokeJoin.Round))
+                drawPath(ShinePath, Color.White.copy(alpha = 0.9f), style = Stroke(width = 2.6f, cap = StrokeCap.Round))
+                drawOval(c.sakura.copy(alpha = 0.6f), topLeft = Offset(22f, 47.4f), size = Size(12f, 7.2f))
+                drawOval(c.sakura.copy(alpha = 0.6f), topLeft = Offset(66f, 47.4f), size = Size(12f, 7.2f))
+                // The original face art sits ~6 units lower; lift it into the bubble.
+                translate(top = -6f) { drawFace(mood, c.sakura) }
+                drawCircle(c.sora, radius = 10f, center = Offset(85f, 20f))
+                drawCircle(Ink, radius = 10f, center = Offset(85f, 20f), style = Stroke(width = 2.2f))
+                drawPath(
+                    BadgeLetterPath,
+                    Color.White,
+                    style = Stroke(width = 2.6f, cap = StrokeCap.Round, join = StrokeJoin.Round),
+                )
             }
         }
     }
