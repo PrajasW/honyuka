@@ -205,4 +205,10 @@ data class TranslationBlock(
     var symHeight: Float,
     var symWidth: Float,
     val angle: Float,
-)
+) {
+    /**
+     * True when this bubble still needs a translation. A "translation" that is just
+     * the original text (left by older builds when a translator failed) counts as missing.
+     */
+    fun needsTranslation(): Boolean = translation.isBlank() || translation.trim() == text.trim()
+}

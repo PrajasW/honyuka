@@ -145,7 +145,7 @@ class TranslationService : Service() {
                 }
 
                 val needsTranslation = translations!!.values.any { page -> 
-                    page.blocks.any { it.translation.isBlank() } 
+                    page.blocks.any { it.needsTranslation() } 
                 }
 
                 if (needsTranslation) {

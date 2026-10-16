@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
 import android.os.Build
+import android.util.Log
 import androidx.documentfile.provider.DocumentFile
 import app.honyuka.model.ChapterEntry
 import app.honyuka.model.LocalBackend
@@ -247,7 +248,7 @@ class TranslationPipeline(
                     ?.boundingBox
                     ?: bounds
                 translation.blocks += TranslationBlock(
-                    text = block.text,
+                    text = block.readingOrderText(),
                     width = bounds.width().toFloat(),
                     height = bounds.height().toFloat(),
                     x = bounds.left.toFloat(),
@@ -259,6 +260,25 @@ class TranslationPipeline(
             }
         translation.blocks = smartMergeBlocks(translation.blocks, 50, 30, 30)
         return translation
+    }
+
+    /**
+     * ML Kit returns the lines of vertical Japanese in arbitrary order. Manga columns
+     * read top-to-bottom, right-to-left, so vertical blocks are re-joined by right edge.
+     */
+    private fun Text.TextBlock.readingOrderText(): String {
+        val boxed = lines.filter { it.boundingBox != null }
+        if (boxed.size <= 1) return text
+        val verticalCount = boxed.count { line ->
+            val box = line.boundingBox!!
+            box.height() > box.width() * VERTICAL_ASPECT
+        }
+        val ordered = if (verticalCount * 2 > boxed.size) {
+            boxed.sortedByDescending { it.boundingBox!!.right }
+        } else {
+            boxed.sortedWith(compareBy({ it.boundingBox!!.top }, { it.boundingBox!!.left }))
+        }
+        return ordered.joinToString("\n") { it.text }
     }
 
     private fun smartMergeBlocks(
@@ -304,8 +324,11 @@ class TranslationPipeline(
         val newY = minOf(first.y, second.y)
         val newWidth = maxOf(first.x + first.width, second.x + second.width) - newX
         val newHeight = maxOf(first.y + first.height, second.y + second.height) - newY
+        // Two vertical columns side by side: the right one is read first.
+        val bothVertical = first.height > first.width * VERTICAL_ASPECT && second.height > second.width * VERTICAL_ASPECT
+        val (lead, follow) = if (bothVertical && second.x > first.x) second to first else first to second
         return TranslationBlock(
-            text = "${first.text} ${second.text}".trim(),
+            text = "${lead.text}\n${follow.text}".trim(),
             translation = "${first.translation} ${second.translation}".trim(),
             width = newWidth,
             height = newHeight,
@@ -360,6 +383,11 @@ class TranslationPipeline(
         val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeStream(stream, null, options)
         return options.outWidth > 0 && options.outHeight > 0
+    }
+
+    private companion object {
+        /** A line or block taller than this × its width is treated as vertical text. */
+        const val VERTICAL_ASPECT = 1.3f
     }
 
     private data class PagePayload(
@@ -458,7 +486,7 @@ private class MlKitTranslationEngine(
         pages.values.forEach { page ->
             page.blocks = page.blocks
                 .mapNotNull { block ->
-                    if (block.translation.isNotBlank()) return@mapNotNull block.takeUnless { it.shouldBeDropped() }
+                    if (!block.needsTranslation()) return@mapNotNull block.takeUnless { it.shouldBeDropped() }
                     totalBlocks++
                     val translatedText = block.text
                         .split("\n")
@@ -470,7 +498,7 @@ private class MlKitTranslationEngine(
                         }
                         .joinToString("\n")
                     if (translatedText.isBlank()) fallbackBlocks++
-                    block.translation = translatedText.ifBlank { block.text }
+                    block.translation = translatedText
                     block.takeUnless { block.shouldBeDropped() }
                 }
                 .toMutableList()
@@ -502,7 +530,7 @@ private class GoogleTranslateWebEngine(
         pages.values.forEach { page ->
             page.blocks = page.blocks
                 .mapNotNull { block ->
-                    if (block.translation.isNotBlank()) return@mapNotNull block.takeUnless { it.shouldBeDropped() }
+                    if (!block.needsTranslation()) return@mapNotNull block.takeUnless { it.shouldBeDropped() }
                     totalBlocks++
                     val sourceText = block.text
                         .split("\n")
@@ -517,7 +545,7 @@ private class GoogleTranslateWebEngine(
                         }
                     }
                     if (translatedText.isBlank()) fallbackBlocks++
-                    block.translation = translatedText.ifBlank { block.text }
+                    block.translation = translatedText
                     block.takeUnless { block.shouldBeDropped() }
                 }
                 .toMutableList()
@@ -561,7 +589,7 @@ private class DeepLTranslationEngine(
 
         val blockRefs = pages.values.flatMap { page ->
             page.blocks
-                .filter { it.translation.isBlank() }
+                .filter { it.needsTranslation() }
                 .map { block -> BlockRef(block = block, text = block.text.trim()) }
         }.filter { it.text.isNotBlank() && !WATERMARK_REGEX.containsMatchIn(it.text) }
 
@@ -570,7 +598,7 @@ private class DeepLTranslationEngine(
             val translations = translateBatch(batch.map { it.text })
             batch.zip(translations).forEach { (ref, translatedText) ->
                 if (translatedText.isBlank()) fallbackBlocks++
-                ref.block.translation = translatedText.ifBlank { ref.block.text }
+                ref.block.translation = translatedText
             }
         }
         if (blockRefs.isNotEmpty() && fallbackBlocks == blockRefs.size) {
@@ -766,7 +794,7 @@ private abstract class LlmBatchTranslationEngine(
         val groups = LinkedHashMap<String, Triple<String, String, MutableList<TranslationBlock>>>()
         for ((pageName, page) in pages) {
             for (block in page.blocks) {
-                if (block.translation.isNotBlank()) continue
+                if (!block.needsTranslation()) continue
                 val text = block.text.trim()
                 if (text.isEmpty() || WATERMARK_REGEX.containsMatchIn(text)) continue
 
@@ -843,6 +871,7 @@ private abstract class LlmBatchTranslationEngine(
         return try {
             parseCompactTranslations(complete(systemPrompt(), buildCompactInput(chunk)), chunk.map { it.globalId }.toSet())
         } catch (e: Exception) {
+            Log.w("HonyukaLlm", "$engineName chunk of ${chunk.size} lines failed (depth $depth)", e)
             if (isFatal(e)) throw e
             if (depth >= maxSplitDepth || chunk.size < 2) return emptyMap()
 
@@ -890,19 +919,30 @@ private abstract class LlmBatchTranslationEngine(
     }
 }
 
-private fun translationSystemPrompt(source: SourceLanguage, target: TargetLanguage): String {
+/**
+ * @param stringIds Gemini's response schema returns ids as strings; free-form local
+ * models copy the example literally, so they get plain numeric ids.
+ */
+private fun translationSystemPrompt(source: SourceLanguage, target: TargetLanguage, stringIds: Boolean = true): String {
+    val exampleOutput = if (stringIds) {
+        "[[\"0\",\"Hey, wait!\"],[\"1\",\"Run!\"]]"
+    } else {
+        "[[0,\"Hey, wait!\"],[1,\"Run!\"]]"
+    }
     return "You are a manga translator. Translate ${source.label} dialogue to concise natural ${target.label}.\n" +
         "Input/output format: [[id,\"text\"],...]\n" +
         "Example:\n" +
         "Input: [[0,\"おい待て\"],[1,\"逃げろ！\"]]\n" +
-        "Output: [[\"0\",\"Hey, wait!\"],[\"1\",\"Run!\"]]\n" +
+        "Output: $exampleOutput\n" +
         "Rules: Preserve IDs. Translate ALL text to ${target.label}. Keep it short for speech bubbles. " +
         "Preserve names and honorifics. Watermarks/URLs → RTMTH. Return JSON array only."
 }
 
 /** Parses `[[id,"text"],…]` model output (ids may be numbers or strings). */
 private fun parseCompactTranslations(raw: String, expectedIds: Set<Int>): Map<Int, String> {
-    val array = repairAndParseArray(sanitiseJson(raw))
+    val array = runCatching { repairAndParseArray(sanitiseJson(raw)) }.getOrElse { error ->
+        return lenientParse(raw, expectedIds).ifEmpty { throw error }
+    }
     val result = HashMap<Int, String>(expectedIds.size)
     for (i in 0 until array.length()) {
         val entry = array.optJSONArray(i) ?: continue
@@ -912,6 +952,27 @@ private fun parseCompactTranslations(raw: String, expectedIds: Set<Int>): Map<In
         if (id in expectedIds && translation.isNotBlank()) {
             result[id] = translation
         }
+    }
+    return result
+}
+
+private val TRAILING_COMMA_ARRAY = Regex(",\\s*\\]")
+private val TRAILING_COMMA_OBJECT = Regex(",\\s*\\}")
+
+/**
+ * Last-resort reader for almost-JSON such as `["1,"text"]` or `[2,""text"]`, which small
+ * on-device models sometimes produce: pulls out each `[id, "text"]` pair by pattern.
+ */
+private val LENIENT_ENTRY = Regex("""\[\s*"?(\d+)"?\s*,\s*"+((?:[^"\\]|\\.)*)"\s*\]""")
+
+private fun lenientParse(raw: String, expectedIds: Set<Int>): Map<Int, String> {
+    val result = HashMap<Int, String>()
+    for (match in LENIENT_ENTRY.findAll(raw)) {
+        val id = match.groupValues[1].toIntOrNull() ?: continue
+        if (id !in expectedIds) continue
+        val body = match.groupValues[2]
+        val text = runCatching { JSONArray("[\"$body\"]").getString(0) }.getOrDefault(body).trim()
+        if (text.isNotBlank()) result[id] = text
     }
     return result
 }
@@ -926,8 +987,9 @@ private fun sanitiseJson(raw: String): String {
         s = s.removeSuffix("```")
     }
     s = s.trim()
-    s = s.replace(Regex(",\\s*]"), "]")
-    s = s.replace(Regex(",\\s*}"), "}")
+    // ] and } must be escaped: Android's ICU regex engine rejects them bare.
+    s = s.replace(TRAILING_COMMA_ARRAY, "]")
+    s = s.replace(TRAILING_COMMA_OBJECT, "}")
     s = s.replace("﻿", "").replace("​", "")
     return s
 }
@@ -1087,13 +1149,20 @@ private class LocalLlmTranslationEngine(
         if (!LocalModelManager.isDownloaded(context, model)) {
             throw LocalModelException("${model.label} isn't downloaded yet. Download it in Settings → On-device model first.")
         }
+        // Some GPU drivers crash natively while LiteRT-LM builds the GPU engine (seen on
+        // Tensor G4), which can't be caught. A marker file written before the GPU attempt
+        // survives that crash; if it's still there next time, Auto skips the GPU for good.
+        val gpuMarker = File(context.filesDir, GPU_CRASH_MARKER)
+        val gpuCrashedBefore = gpuMarker.exists()
         val backends = when (backendPreference) {
-            LocalBackend.AUTO -> listOf(Backend.GPU(), Backend.CPU())
+            LocalBackend.AUTO -> if (gpuCrashedBefore) listOf(cpuBackend()) else listOf(Backend.GPU(), cpuBackend())
             LocalBackend.GPU -> listOf(Backend.GPU())
-            LocalBackend.CPU -> listOf(Backend.CPU())
+            LocalBackend.CPU -> listOf(cpuBackend())
         }
         var lastError: Throwable? = null
         for (backend in backends) {
+            val isGpu = backend is Backend.GPU
+            if (isGpu && backendPreference == LocalBackend.AUTO) gpuMarker.writeText("1")
             val candidate = Engine(
                 EngineConfig(
                     modelPath = file.absolutePath,
@@ -1104,6 +1173,7 @@ private class LocalLlmTranslationEngine(
             )
             try {
                 candidate.initialize()
+                if (isGpu) gpuMarker.delete()
                 engine = candidate
                 return
             } catch (t: Throwable) {
@@ -1118,7 +1188,15 @@ private class LocalLlmTranslationEngine(
         )
     }
 
+    /** Use most cores; LiteRT-LM's default CPU thread count is conservative. */
+    private fun cpuBackend(): Backend {
+        val threads = (Runtime.getRuntime().availableProcessors() - 1).coerceIn(2, 8)
+        return Backend.CPU(numOfThreads = threads)
+    }
+
     override fun isFatal(error: Exception): Boolean = error is LocalModelException
+
+    override fun systemPrompt(): String = translationSystemPrompt(sourceLanguage, targetLanguage, stringIds = false)
 
     override fun complete(systemPrompt: String, userText: String): String {
         val activeEngine = engine ?: throw LocalModelException("On-device model is not loaded.")
@@ -1136,9 +1214,11 @@ private class LocalLlmTranslationEngine(
         }
         return conversation.use {
             val reply = it.sendMessage(userText)
-            reply.contents.contents
+            val text = reply.contents.contents
                 .filterIsInstance<Content.Text>()
                 .joinToString("") { part -> part.text }
+            Log.d(TAG, "Local model reply: ${text.length} chars")
+            text
         }
     }
 
@@ -1151,6 +1231,8 @@ private class LocalLlmTranslationEngine(
         /** Prompt + output must fit; Gemma 4 E2B/E4B allow much more, but memory is tight. */
         const val MAX_CONTEXT_TOKENS = 4_096
         const val MAX_OUTPUT_TOKENS = 2_048
+        const val GPU_CRASH_MARKER = "litertlm_gpu_attempt"
+        const val TAG = "HonyukaLocalLlm"
     }
 }
 

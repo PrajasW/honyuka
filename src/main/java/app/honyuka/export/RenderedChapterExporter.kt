@@ -319,7 +319,7 @@ class RenderedChapterExporter(
         pageName: String,
         translation: PageTranslation,
     ): RenderedPage {
-        val drawableBlocks = translation.blocks.filter { it.translation.isNotBlank() }
+        val drawableBlocks = translation.blocks.filterNot { it.needsTranslation() }
         if (drawableBlocks.isEmpty()) {
             return RenderedPage(pageName, originalBytes)
         }

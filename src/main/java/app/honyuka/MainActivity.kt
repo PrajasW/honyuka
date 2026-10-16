@@ -7,6 +7,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.provider.DocumentsContract
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -15,6 +16,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -49,6 +51,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -60,6 +63,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -111,6 +115,17 @@ class MainActivity : ComponentActivity() {
         setContent {
             val pickRoot = rememberTreePickerLauncher()
             val state by viewModel.state.collectAsStateWithLifecycle()
+            val darkTheme = when (state.themeMode) {
+                ThemeMode.AUTO -> isSystemInDarkTheme()
+                ThemeMode.WASHI -> false
+                ThemeMode.YORU -> true
+            }
+            // Status/nav bar icons follow the app theme, not just the system setting.
+            DisposableEffect(darkTheme) {
+                val style = SystemBarStyle.auto(Color.Transparent.toArgb(), Color.Transparent.toArgb()) { darkTheme }
+                enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
+                onDispose { }
+            }
             HonyukaTheme(themeMode = state.themeMode) {
                 HonyukaApp(
                     viewModel = viewModel,
@@ -512,7 +527,7 @@ private fun OnDeviceSettings(state: HonyukaUiState, viewModel: HonyukaViewModel)
             onSelect = viewModel::onLocalBackendSelected,
         )
         Text(
-            "Auto tries the GPU first and falls back to CPU.",
+            "Auto tries the GPU first and falls back to CPU — and remembers if the GPU crashed on this phone.",
             style = MaterialTheme.typography.bodySmall,
             color = c.textFaint,
         )
