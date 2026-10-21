@@ -93,14 +93,6 @@ Pick the same root folder Mihon uses:
 
 In-progress Mihon downloads (`*_tmp`) are skipped. Deleting a chapter's `.json` makes Honyuka read its pages again on the next translate.
 
-## Evaluation
-
-<p align="center">
-  <img src="docs/plots/lpips_evaluation_plot_clean.png" width="60%" alt="LPIPS evaluation plot">
-</p>
-
-LPIPS (perceptual distance) of **PatchPoison** compared with common image corruptions (JPEG, Gaussian blur, Gaussian noise, rotation, shear). X axis: LPIPS between the poisoned image and its render (higher is better). Y axis: LPIPS between the poisoned image and the original (lower is better, i.e. less visible). Vector versions: [SVG](docs/plots/lpips_evaluation_plot_clean.svg) · [PDF](docs/plots/lpips_evaluation_plot_clean.pdf).
-
 ## Settings
 
 - **Theme:** Auto, ☀️ Washi (light) or 🌙 Yoru (dark).
